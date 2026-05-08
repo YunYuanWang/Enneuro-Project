@@ -28,7 +28,7 @@ serializer = Serializer()
 script_dir = os.path.dirname(os.path.abspath(__file__))
 save_folder = os.path.join(script_dir, "results")
 os.makedirs(save_folder, exist_ok=True)
-model_path = os.path.join(save_folder, "model.json")
+model_path = os.path.join(save_folder, "model_gpu.json")
 
 if os.path.exists(model_path):
     print(f"Loading pre-trained model from {model_path}...")
@@ -66,7 +66,8 @@ trainer.fit(
     val_loader,
     epochs=total_epochs,
     batch_size=batch_size,
-    verbose=True
+    verbose=True,
+    device='cuda'
 )
 
 print(f"Saving model to {save_folder}/model.json...")

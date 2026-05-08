@@ -1997,11 +1997,34 @@ class BatchNorm2d(Function):
 
         # 更新 running 统计量（训练时）
         if Config.train:
-            # 转为 (C,) 方便存储
-            m = mean.reshape(C)
-            v = var.reshape(C)
-            self.running_mean.data = self.momentum * self.running_mean.data + (1 - self.momentum) * m
-            self.running_var.data  = self.momentum * self.running_var.data  + (1 - self.momentum) * v
+            # 优先从running_mean获取数组模块（因为它在GPU上）
+            # 如果running_mean是numpy，则使用numpy
+            running_mean_data = self.running_mean.data
+            xp = get_array_module(running_mean_data)
+
+            # 确保所有数组都是xp类型
+            if xp is not np:
+                # 使用to_xp确保所有数组都正确转换
+                m = to_xp(mean.reshape(C), xp)
+                v = to_xp(var.reshape(C), xp)
+                running_mean_data = to_xp(running_mean_data, xp)
+                running_var_data = to_xp(self.running_var.data, xp)
+                momentum = xp.asarray(self.momentum)
+                one_minus_momentum = xp.asarray(1) - momentum
+            else:
+                m = mean.reshape(C)
+                v = var.reshape(C)
+                running_var_data = self.running_var.data
+                momentum = self.momentum
+                one_minus_momentum = 1 - self.momentum
+
+            new_mean = momentum * running_mean_data + one_minus_momentum * m
+            new_var = momentum * running_var_data + one_minus_momentum * v
+
+            # 更新running统计量
+            self.running_mean.data = new_mean
+            self.running_var.data = new_var
+
             # 保存当前 batch 的统计量用于反向传播
             self.mean = mean
             self.var = var
@@ -2013,12 +2036,28 @@ class BatchNorm2d(Function):
             self.var = var
 
         # 归一化
-        xp = get_array_module(x)
+        # 优先从running_mean获取xp，确保一致性
+        xp = get_array_module(self.running_mean.data)
+        if xp is np:
+            xp = get_array_module(x)
+
+        # 确保所有数组都是xp类型
+        if xp is not np:
+            # 将所有数组转换为cupy
+            x = to_xp(x, xp)
+            mean = to_xp(mean, xp)
+            var = to_xp(var, xp)
+            gamma_data = to_xp(gamma, xp)
+            beta_data = to_xp(beta, xp)
+        else:
+            gamma_data = gamma
+            beta_data = beta
+
         x_hat = (x - mean) / xp.sqrt(var + self.eps)
         # 缩放和偏移
-        out = gamma.reshape(1, C, 1, 1) * x_hat + beta.reshape(1, C, 1, 1)
+        out = gamma_data.reshape(1, C, 1, 1) * x_hat + beta_data.reshape(1, C, 1, 1)
         self.x_hat = x_hat
-        self.gamma = gamma
+        self.gamma = gamma_data
         return out
 
     def backward(self, gys):
