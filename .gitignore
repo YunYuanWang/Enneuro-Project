@@ -14,3 +14,7 @@ tests/*.json
 tests/testdata/
 tests/test_donkey/data/
 tests/data.zip
+*.json
+*.png
+*.jpg
+*.jpeg

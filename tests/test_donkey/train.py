@@ -1,82 +1,107 @@
-# 导入系统库
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent / 'code'))
+
 import os
+import numpy as np
+import matplotlib.pyplot as plt
 
-# 导入paddle库
-import paddle
-from visualdl import LogWriter
-import paddle.vision.transforms as transforms
+from eneuro.nn.optim import Adam
+from eneuro.nn.loss import meanSquaredError
+from eneuro.train import Trainer
+from eneuro.utils import Visualizer
+from eneuro.data.dataloader import DataLoader
 
-# 导入自定义库
-from model import AutoDriveNet
-from dataset import AutoDriveDataset
+from dataset import AutoDriveDataset, preprocess_image
+from model import ResNet18AutoDrive
 
 
-# 参数定义
-batch_size = 400  # 批大小
-start_epoch = 1  # 轮数起始位置
-epochs = 100  # 遍历次数
-lr = 1e-4  # 学习率
-# 设备参数
-paddle.set_device("gpu")
-# paddle.set_device("cpu")
-# 全局记录器
-writer = LogWriter()
-# 初始化模型
-model = AutoDriveNet()
-# 初始化优化器
-optimizer = paddle.optimizer.Adam(learning_rate=lr, parameters=model.parameters())
-# 定义损失函数
-criterion = paddle.nn.MSELoss()
-# 定义预处理器
-transformations = transforms.Compose(
-    [
-        transforms.ToTensor(),  # 通道置前并且将0-255值映射至0-1
-    ]
-)
-# 定义数据集类变量
-train_dataset = AutoDriveDataset(mode="train", transform=transformations)
-# 定义数据集加载器
-train_loader = paddle.io.DataLoader(
+batch_size = 64
+total_epochs = 20
+lr =1e-4
+
+model = ResNet18AutoDrive()
+
+from eneuro.utils.serializer import Serializer
+serializer = Serializer()
+script_dir = os.path.dirname(os.path.abspath(__file__))
+save_folder = os.path.join(script_dir, "results")
+os.makedirs(save_folder, exist_ok=True)
+model_path = os.path.join(save_folder, "model.json")
+
+if os.path.exists(model_path):
+    print(f"Loading pre-trained model from {model_path}...")
+    serializer.load(model, model_path)
+    print("Model loaded successfully. Starting fine-tuning...")
+else:
+    print("No pre-trained model found, starting training from scratch")
+
+optimizer = Adam(model.params(), lr=lr)
+
+loss_fn = meanSquaredError
+
+visualizer = Visualizer(num_classes=1)
+
+train_dataset = AutoDriveDataset(mode="train", transform=preprocess_image)
+train_loader = DataLoader(
     train_dataset,
     batch_size=batch_size,
     shuffle=True,
     drop_last=True,
-    num_workers=0,
-    return_list=True,
 )
 
-# 开始逐轮迭代训练
-for epoch in range(start_epoch, epochs + 1):
-    # 开启训练模式
-    model.train()
-    # 统计单个epoch的损失函数
-    loss_epoch = 0
-    # 按批处理
-    for i, (imgs, labels) in enumerate(train_loader):
-        # 前向传播
-        pre_labels = model(imgs)
-        # 计算损失
-        loss = criterion(pre_labels, labels)
-        # 后向传播
-        optimizer.clear_grad()
-        loss.backward()
-        # 更新模型
-        optimizer.step()
-        # 记录损失值
-        loss_epoch += float(loss)
-        # # 打印结果
-        # print("第 " + str(i) + " 个batch训练结束")
+val_dataset = AutoDriveDataset(mode="val", transform=preprocess_image)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=batch_size,
+    shuffle=True,
+    drop_last=True,
+)
 
-    # 手动释放内存
-    del imgs, labels, pre_labels
-    # 监控损失值变化
-    loss_epoch_avg = loss_epoch / train_dataset.__len__()
-    writer.add_scalar("MSE_Loss", loss_epoch_avg, epoch)
-    print("epoch:" + str(epoch) +"  MSE_Loss:" + str(loss_epoch_avg))
+trainer = Trainer(model, loss_fn, optimizer, visualizer)
 
-# 保存模型
-script_dir = os.path.dirname(os.path.abspath(__file__))
-save_folder = os.path.join(script_dir, "results")  # 数据集根目录
-paddle.save(model.state_dict(), save_folder + "/model.pdparams")
-# 训练结束关闭监控
-writer.close()
+trainer.fit(
+    train_loader,
+    val_loader,
+    epochs=total_epochs,
+    batch_size=batch_size,
+    verbose=True
+)
+
+print(f"Saving model to {save_folder}/model.json...")
+serializer.save(model, save_folder + "/model.json")
+print("Model saved successfully.")
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+fig.suptitle('Training Visualization (Regression)', fontsize=16)
+
+axes[0].plot(visualizer.train_loss, label='Train Loss')
+axes[0].plot(visualizer.val_loss, label='Val Loss')
+axes[0].set_title('Loss Curve')
+axes[0].set_xlabel('Epoch')
+axes[0].set_ylabel('Loss')
+axes[0].legend()
+axes[0].grid(True)
+
+axes[1].plot(visualizer.epoch_times)
+axes[1].set_title('Time Consumption per Epoch')
+axes[1].set_xlabel('Epoch')
+axes[1].set_ylabel('Time (seconds)')
+axes[1].grid(True)
+
+axes[2].plot(visualizer.train_loss, label='Train Loss')
+axes[2].plot(visualizer.val_loss, label='Val Loss')
+axes[2].set_title('Loss Curve (Zoomed)')
+axes[2].set_xlabel('Epoch')
+axes[2].set_ylabel('Loss')
+axes[2].set_ylim([0, 0.05])
+axes[2].legend()
+axes[2].grid(True)
+
+plt.tight_layout()
+plt.subplots_adjust(top=0.88)
+plt.savefig(os.path.join(save_folder, "training_curves.png"), dpi=150, bbox_inches='tight')
+print(f"Training curves saved to {save_folder}/training_curves.png")
+plt.show()
+plt.close()

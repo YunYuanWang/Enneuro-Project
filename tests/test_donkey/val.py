@@ -1,58 +1,47 @@
-# 导入系统库
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent / 'code'))
+
 import time
 import os
+import numpy as np
 
-# 导入Paddle库
-import paddle
-import paddle.vision.transforms as transforms
+from eneuro.nn.loss import meanSquaredError
+from eneuro.train import Evaluator
 
-# 导入自定义库
-from dataset import AutoDriveDataset
-from model import AutoDriveNet
+from dataset import AutoDriveDataset, preprocess_image
+from model import ResNet18AutoDrive
+from eneuro.utils.serializer import Serializer
 
 
-# 定义设备运行环境
-paddle.set_device("gpu")
-# 加载训练好的模型文件
-model = AutoDriveNet()
+model = ResNet18AutoDrive()
 script_dir = os.path.dirname(os.path.abspath(__file__))
-model_folder = os.path.join(script_dir, "results", "model.pdparams")  # 数据集根目录
-checkpoint = paddle.load(model_folder)
-model.set_state_dict(checkpoint)
-# 定义预处理器
-transformations = transforms.Compose(
-    [
-        transforms.ToTensor(),  # 通道置前并且将0-255RGB值映射至0-1
-    ]
-)
-# 创建验证数据集类实例
-val_dataset = AutoDriveDataset(mode="val", transform=transformations)
-# 创建数据集加载器
-val_loader = paddle.io.DataLoader(
+model_folder = os.path.join(script_dir, "results", "model.json")
+
+serializer = Serializer()
+serializer.load(model, model_folder)
+
+val_dataset = AutoDriveDataset(mode="val", transform=preprocess_image)
+
+from eneuro.data.dataloader import DataLoader
+val_loader = DataLoader(
     val_dataset,
     batch_size=400,
     shuffle=True,
     drop_last=True,
-    num_workers=0,
-    return_list=True,
 )
-# 定义评估指标
-criterion = paddle.nn.MSELoss()
-# 记录均方误差值
-MSEs = 0
-nbatch = 0
-# 记录测试时间
-model.eval()
+
+loss_fn = meanSquaredError
+
+evaluator = Evaluator(model, loss_fn)
+
 start = time.time()
-with paddle.no_grad():
-    # 逐批样本进行推理计算
-    for i, (imgs, labels) in enumerate(val_loader):
-        # 前向传播
-        pre_labels = model(imgs)
-        # 计算误差
-        loss = criterion(pre_labels, labels)
-        MSEs += loss.numpy()
-        nbatch += 1
-# 输出平均均方误差
-print("MSE: " + ("%f" % (MSEs / nbatch)))
-print("平均单张样本用时  {:.3f} 秒".format((time.time() - start) / len(val_dataset)))
+test_loss, test_acc = evaluator.evaluate(
+    val_loader,
+    batch_size=400,
+    verbose=True
+)
+
+print(f"MSE: {test_loss:.6f}")
+print(f"平均单张样本用时 {(time.time() - start) / len(val_dataset):.3f} 秒")

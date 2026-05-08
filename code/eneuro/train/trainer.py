@@ -1,6 +1,12 @@
 import numpy as np
+try:
+    import cupy as cp
+    has_cupy = True
+except ImportError:
+    has_cupy = False
 from ..base import Tensor
 from ..base import as_Tensor
+from ..base.functions import get_array_module
 # from .meters import TimeMeter, AverageMeter
 from ..base import Config
 
@@ -17,6 +23,37 @@ def progress_bar(current, total, epoch, loss, acc, width=30): # 进度条
         f' | loss={loss:.4f} | acc={acc:.3f}'
     )
     sys.stdout.flush()
+
+
+def _is_multilabel(y_hat, yb):
+    return yb.ndim > 1 and y_hat.ndim == yb.ndim and y_hat.shape == yb.shape
+
+
+def _is_regression(y_hat, yb, loss_fn=None):
+    if loss_fn is not None:
+        loss_name = getattr(loss_fn, "__name__", "")
+        if loss_name == "meanSquaredError":
+            return True
+    return y_hat.ndim > 1 and y_hat.shape[-1] == 1 and yb.ndim == 1
+
+
+def _batch_accuracy(y_hat, yb, y_true_cls, loss_fn=None):
+    if _is_regression(y_hat, yb, loss_fn=loss_fn):
+        return None, None
+
+    if _is_multilabel(y_hat, yb):
+        y_pred = (y_hat.data > 0.5).astype(np.int32)
+        y_true = yb.data.astype(np.int32)
+        batch_acc = np.all(y_pred == y_true, axis=1).mean()
+        return y_pred, y_true, batch_acc
+
+    if y_hat.ndim > 1:
+        y_pred = y_hat.argmax(axis=1)
+    else:
+        y_pred = y_hat
+    y_true = y_true_cls
+    batch_acc = (y_pred == y_true).mean()
+    return y_pred, y_true, batch_acc
 
 class Trainer:
     def __init__(self, model, loss_fn, optimizer, visualizer=None, enable_early_stop=False):
@@ -42,14 +79,24 @@ class Trainer:
 
 
     def fit(self, train_loader, val_loader, epochs=10, batch_size=32, 
-                verbose=True, device='cpu'):
+                verbose=True, device='cpu', start_epoch=0, checkpoint_path=None, serializer=None):
         """
             only accept DataLoader object
             if you need to split train/val dataset, please do it outside this function
         """
-        # self.model.to(device)
+        self.model = self.model.to(device)
+        
+        if verbose:
+            # 从 model 中随机抓取一个参数判断其类型以确认训练设备
+            for param in self.model.params():
+                if param.data is not None:
+                    if has_cupy and isinstance(param.data, cp.ndarray):
+                        print(f"using cuda to train")
+                    else:
+                        print(f"using cpu to train")
+                    break
 
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             if verbose:
                 print(f"======================= Epoch #{epoch+1}/{epochs} - Start training =======================")
             self._epoch = epoch
@@ -71,6 +118,12 @@ class Trainer:
             # 使用visualizer更新epoch时间
             if self.visualizer is not None:
                 self.visualizer.update_epoch(epoch_time)
+            
+            # 保存checkpoint
+            if checkpoint_path and serializer:
+                serializer.save_checkpoint(self.model, self.optimizer, epoch, checkpoint_path)
+                if verbose:
+                    print(f"Checkpoint saved to {checkpoint_path}")
             
             # 早停
             # if self.enable_early_stop:
@@ -103,14 +156,14 @@ class Trainer:
         for batch_idx, (Xb, yb) in enumerate(data_loader):
             Xb = as_Tensor(Xb)
             yb = as_Tensor(yb)
-            # Xb = Xb.to(device)
-            # yb = yb.to(device)
+            Xb = Xb.to(device)
+            yb = yb.to(device)
             y_hat = self.model(Xb)
 
             # 兼容单标签分类与多标签分类
             if yb.ndim > 1:
                 y_true_cls = yb.argmax(axis=1)
-                if y_hat.ndim == yb.ndim and y_hat.shape == yb.shape:
+                if _is_multilabel(y_hat, yb):
                     # 多标签任务（如 SigmoidWithLoss）
                     y_target = yb
                 else:
@@ -122,17 +175,13 @@ class Trainer:
 
             loss = self.loss_fn(y_hat, y_target)
 
-            if y_hat.ndim > 1:
-                if yb.ndim > 1 and y_hat.shape == yb.shape:
-                    # 多标签预测：阈值化后逐元素比较
-                    y_pred = (y_hat.data > 0.5).astype(np.int32)
-                    y_true = yb.data.astype(np.int32)
-                else:
-                    y_pred = y_hat.argmax(axis=1)
-                    y_true = y_true_cls
+            batch_acc_info = _batch_accuracy(y_hat, yb, y_true_cls, loss_fn=self.loss_fn)
+            if batch_acc_info[0] is None:
+                y_pred = y_hat.data
+                y_true = y_true_cls.data if hasattr(y_true_cls, "data") else y_true_cls
+                batch_acc = np.nan
             else:
-                y_pred = y_hat
-                y_true = y_true_cls
+                y_pred, y_true, batch_acc = batch_acc_info
 
             if training:
                 self.model.cleargrads()
@@ -147,28 +196,30 @@ class Trainer:
             y_pred_list.append(y_pred)
             
             loss_sum += loss.data * len(Xb)
-            acc_sum += (y_pred == y_true).sum()
+            if not np.isnan(batch_acc):
+                acc_sum += batch_acc * len(Xb)
             sample_num += len(Xb)
 
             # 使用visualizer更新指标
             if self.visualizer is not None:
-                batch_acc = (y_pred == y_true).sum() / len(Xb)
-                if training:
-                    self.visualizer.update_train(loss.data, batch_acc, batch_size=len(Xb))
-                else:
-                    self.visualizer.update_val(loss.data, batch_acc, batch_size=len(Xb))
+                if not np.isnan(batch_acc):
+                    if training:
+                        self.visualizer.update_train(loss.data, batch_acc, batch_size=len(Xb))
+                    else:
+                        self.visualizer.update_val(loss.data, batch_acc, batch_size=len(Xb))
             
             # self.loss_meter.update(loss.data)
             # self.acc_meter.update(acc_sum / sample_num)
             
             if verbose:
-                progress_bar(batch_idx * batch_size + len(Xb), len(data_loader.dataset), self._epoch, loss.data, acc_sum / sample_num)
+                display_acc = (acc_sum / sample_num) if sample_num > 0 and not np.isnan(acc_sum) else np.nan
+                progress_bar(batch_idx * batch_size + len(Xb), len(data_loader.dataset), self._epoch, loss.data, display_acc)
         if verbose:
             sys.stdout.write('\n')
         
         # 计算epoch级别的指标
         epoch_loss = loss_sum / sample_num
-        epoch_acc = acc_sum / sample_num
+        epoch_acc = acc_sum / sample_num if acc_sum != 0 else (np.nan if _is_regression(y_hat, yb, loss_fn=self.loss_fn) else 0.0)
         
         # 更新visualizer的预测结果
         if self.visualizer is not None and not training:
@@ -195,19 +246,19 @@ class Evaluator:
         if verbose:
             print(f"======================= Start evaluation =======================")
 
-        # self.model.to(device)
+        self.model = self.model.to(device)
         for batch_idx, (Xb, yb) in enumerate(data_loader):
             Xb = as_Tensor(Xb)
             yb = as_Tensor(yb)
-            # Xb = Xb.to(device)
-            # yb = yb.to(device)
+            Xb = Xb.to(device)
+            yb = yb.to(device)
 
             with Config.using_config('train', False):
                 y_hat = self.model(Xb)
 
                 if yb.ndim > 1:
                     y_true_cls = yb.argmax(axis=1)
-                    if y_hat.ndim == yb.ndim and y_hat.shape == yb.shape:
+                    if _is_multilabel(y_hat, yb):
                         y_target = yb
                     else:
                         y_target = y_true_cls
@@ -217,29 +268,27 @@ class Evaluator:
 
                 loss = self.loss_fn(y_hat, y_target)
 
-            if y_hat.ndim > 1:
-                if yb.ndim > 1 and y_hat.shape == yb.shape:
-                    y_pred = (y_hat.data > 0.5).astype(np.int32)
-                    y_true = yb.data.astype(np.int32)
-                else:
-                    y_pred = y_hat.data.argmax(axis=1)
-                    y_true = y_true_cls
-            else:
+            batch_acc_info = _batch_accuracy(y_hat, yb, y_true_cls, loss_fn=self.loss_fn)
+            if batch_acc_info[0] is None:
                 y_pred = y_hat.data
-                y_true = y_true_cls
+                y_true = y_true_cls.data if hasattr(y_true_cls, "data") else y_true_cls
+                batch_acc = np.nan
+            else:
+                y_pred, y_true, batch_acc = batch_acc_info
             
             # 收集预测结果和真实标签
             y_true_list.append(y_true)
             y_pred_list.append(y_pred)
             
             loss_sum += loss.data * len(Xb)
-            acc_sum += (y_pred == y_true).sum()
+            if not np.isnan(batch_acc):
+                acc_sum += batch_acc * len(Xb)
             sample_num += len(Xb)
 
             # 使用visualizer更新指标
             if self.visualizer is not None:
-                batch_acc = (y_pred == y_true).sum() / len(Xb)
-                self.visualizer.update_val(loss.data, batch_acc, batch_size=len(Xb))
+                if not np.isnan(batch_acc):
+                    self.visualizer.update_val(loss.data, batch_acc, batch_size=len(Xb))
                 self.visualizer.update_predictions(y_true, y_pred)
             
             # self.loss_meter.update(loss.data)
@@ -247,7 +296,7 @@ class Evaluator:
         
         # 计算评估结果
         loss = loss_sum / sample_num
-        acc = acc_sum / sample_num
+        acc = acc_sum / sample_num if acc_sum != 0 else (np.nan if _is_regression(y_hat, yb, loss_fn=self.loss_fn) else 0.0)
         
         return loss, acc
 

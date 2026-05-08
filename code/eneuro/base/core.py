@@ -2,12 +2,26 @@ from __future__ import annotations  # 统一把注解变成字符串,在类定�
 from typing import List
 from ..utils import StateDict
 import numpy as np
+try:
+    import cupy as cp
+    has_cupy = True
+except ImportError:
+    has_cupy = False
 import weakref
 import contextlib
 from functools import total_ordering
 from eneuro.base import functions as f
 from eneuro.global_config import VISUAL_CONFIG
 import cv2
+
+def get_array_module(arr):
+    """根据输入数组类型返回对应的数组模块(numpy或cupy)"""
+    if isinstance(arr, Tensor):
+        return get_array_module(arr.data)
+    if isinstance(arr, cp.ndarray):
+        return cp
+    else:
+        return np
 
 
 class Config:
@@ -38,13 +52,50 @@ class Config:
 
 @total_ordering
 class Tensor(StateDict):
-    def __init__(self, data, requires_grad=False, name=None) -> None:
-        self.data = data
+    def __init__(self, data, requires_grad=False, name=None, device='cpu') -> None:
+        self.device = device
+        self._data = None
+        if data is None:
+            self._data = None
+        elif device == 'cpu':
+            if isinstance(data, np.ndarray):
+                self._data = data
+            elif has_cupy and isinstance(data, cp.ndarray):
+                self._data = cp.asnumpy(data)
+            else:
+                self._data = np.array(data)
+        elif device == 'cuda' or device == 'gpu':
+            if not has_cupy:
+                raise RuntimeError("Cupy is not installed. Please install it to use CUDA devices.")
+            if isinstance(data, cp.ndarray):
+                self._data = data
+            elif isinstance(data, np.ndarray):
+                self._data = cp.asarray(data)
+            else:
+                self._data = cp.array(data)
+        else:
+            raise ValueError(f"Unknown device: {device}")
+        # self.data = data
         self.requires_grad = requires_grad
         self.name = name
         self.grad = None
         self.creator = None
         self.generation = 0
+
+    @property
+    def data(self):
+        return self._data
+    
+    @data.setter
+    def data(self, value):
+        if value is None:
+            self._data = None
+        elif self.device == 'cuda' and isinstance(value, np.ndarray):
+            self._data = cp.asarray(value)
+        elif self.device == 'cpu' and has_cupy and isinstance(value, cp.ndarray):
+            self._data = cp.asnumpy(value)
+        else:
+            self._data = value
 
     @property
     def shape(self):
@@ -87,6 +138,37 @@ class Tensor(StateDict):
             return self.data < other.data
         else:
             return self.data < other
+    
+    def to(self, device='cpu'):
+        if device == self.device:
+            return self
+        if self._data is None:
+            self.device = device
+            return self
+        if self._data.dtype == np.object_:
+            raise ValueError(f"Cannot convert tensor '{self.name}' with dtype 'object' to CUDA. Data: {self._data}")
+        if device == 'cpu':
+            if has_cupy and isinstance(self._data, cp.ndarray):
+                self = Tensor(cp.asnumpy(self._data), requires_grad=self.requires_grad, name=self.name, device=device)
+                return self
+            elif isinstance(self._data, np.ndarray):
+                return self
+            else:
+                self = Tensor(np.array(self._data), requires_grad=self.requires_grad, name=self.name, device=device)
+                return self
+        if device == 'cuda' or device == 'gpu':
+            if not has_cupy:
+                raise RuntimeError("Cupy is not installed. Please install it to use CUDA devices.")
+            if isinstance(self._data, cp.ndarray):
+                return self
+            elif isinstance(self._data, np.ndarray):
+                self = Tensor(cp.asarray(self._data), requires_grad=self.requires_grad, name=self.name, device=device)
+                return self
+            else:
+                self = Tensor(cp.array(self._data), requires_grad=self.requires_grad, name=self.name, device=device)
+                return self
+
+
 
     def set_creator(self, func):
         self.creator = func
@@ -102,7 +184,10 @@ class Tensor(StateDict):
         return self.data.argmax(axis=axis)
     
     def sum(self, axis=None, keepdims=False):
-        return Tensor(np.sum(self.data, axis=axis, keepdims=keepdims))
+        if self.device == 'cpu':
+            return Tensor(np.sum(self.data, axis=axis, keepdims=keepdims))
+        if has_cupy:
+            return Tensor(cp.sum(self.data, axis=axis, keepdims=keepdims))
     
     def mean(self, axis=None, keepdims=False):
         from .functions import Mean
@@ -110,7 +195,10 @@ class Tensor(StateDict):
 
     def backward(self, retain_grad=False, create_graph=False):
         if self.grad is None:
-            self.grad = Tensor(np.ones_like(self.data))
+            if self.device == 'cpu':
+                self.grad = Tensor(np.ones_like(self.data))
+            elif has_cupy:
+                self.grad = Tensor(cp.ones_like(self.data))
 
         funcs = []
         seen_set = set()
@@ -135,6 +223,8 @@ class Tensor(StateDict):
                     gxs = (gxs,)
 
                 for x, gx in zip(f.inputs, gxs):
+                    if gx is None:
+                        continue
                     # if not isinstance(gx, Tensor):
                     #     gx = Tensor(gx)
                     assert isinstance(gx,Tensor), "请检查反向传播中的数据是否是Tensor类型！"
@@ -194,9 +284,16 @@ class Tensor(StateDict):
     @staticmethod
     def stack(tensors: List['Tensor']) -> 'Tensor':
         """堆叠多个Tensor"""
+        if tensors[0].device == 'cpu':
+            xp = np
+        elif tensors[0].device == 'cuda' or tensors[0].device == 'gpu':
+            if has_cupy:
+                xp = cp
+        else:
+            raise ValueError("Stack operation is not supported on the device type.")
         if not tensors:
-            return Tensor(np.array([]))
-        return Tensor(np.stack([t.data for t in tensors]))
+            return Tensor(xp.array([]))
+        return Tensor(xp.stack([t.data for t in tensors]))
 
     def using_config(self, param, create_graph):
         pass
@@ -211,11 +308,17 @@ def from_dict(d: dict) -> None:  # 序列化读取数据
 
 
 def as_array(x):
-    """将输入转换为numpy数组"""
+    """将输入转换为numpy/cupy数组"""
     if isinstance(x, Tensor):
+        if x.device == 'cpu' and isinstance(x.data, cp.ndarray):
+            x.data = cp.asnumpy(x.data)
+        if (x.device == 'cuda' or x.device == 'gpu') and isinstance(x.data, np.ndarray):
+            x.data = cp.asarray(x.data)
         return as_array(x.data)
-    if np.isscalar(x):
-        return np.array(x)
+    
+    xp = get_array_module(x)
+    if xp.isscalar(x):
+        return xp.array(x)
     return x
 
 
@@ -223,7 +326,7 @@ def as_Tensor(x):
     """将输入转换为Tensor对象"""
     if isinstance(x, Tensor):
         return x
-    return Tensor(x)
+    return Tensor(as_array(x))
 
 
 class Function:
@@ -266,6 +369,8 @@ class Function:
     def _print_output(self, output_tensor):
         # 和Layer类的_print_output逻辑完全一致（复制粘贴）
         data = output_tensor.data if hasattr(output_tensor, 'data') else output_tensor
+        if isinstance(data, cp.ndarray):
+            data = cp.asnumpy(data)
         if data.ndim != 4:
             return
 
@@ -304,13 +409,13 @@ def square(x):
     
 class Exp(Function):
     def forward(self, x):
-        y = np.exp(x)
-        return y
+        xp = get_array_module(x)
+        return xp.exp(x)
 
     def backward(self, gy):
         x = self.inputs[0].data
-        gx = np.exp(x) * gy
-        return gx
+        xp = get_array_module(x)
+        return xp.exp(x) * gy
 def exp(x):
     return Exp()(x) # you can use exp(x) to call the forward method of the Exp clasa
 
@@ -327,7 +432,7 @@ class Add(Function):
             gx1 = f.sum_to(gx1, self.x1_shape)
         return gx0, gx1
 def add(x0, x1):
-    x1 = as_array(x1)
+    x1 = as_Tensor(x1)
     return Add()(x0, x1)
 # Variable.__add__ = add
 # Variable.__radd__ = add
@@ -347,7 +452,7 @@ class Mul(Function):
             gx1 = f.sum_to(gx1, self.x1_shape)
         return gx0 * x1, gx1 * x0
 def mul(x0, x1):
-    x1 = as_array(x1)
+    x1 = as_Tensor(x1)
     return Mul()(x0, x1)
 # Variable.__mul__ = mul
 # Variable.__rmul__ = mul
@@ -377,11 +482,12 @@ class Sub(Function):
         return gx0, -gx1
 
 def sub(x0, x1):
-    x1 = as_array(x1)
+    x1 = as_Tensor(x1)
     return Sub()(x0, x1)
 # Variable.__sub__ = sub
 def rsub(x0, x1):
-    x1 = as_array(x1)
+    x0 = as_Tensor(x0)
+    x1 = as_Tensor(x1)
     return Sub()(x1, x0) # rsub is the same as sub but with the arguments reversed
 # Variable.__rsub__ = rsub
 
@@ -401,11 +507,12 @@ class Div(Function):
         return gx0 / x1, -gx1 * x0 / x1 ** 2
 
 def div(x0, x1):
-    x1 = as_array(x1)
+    x1 = as_Tensor(x1)
     return Div()(x0, x1)
 # Variable.__truediv__ = div
 def rdiv(x0, x1):
-    x1 = as_array(x1)
+    x0 = as_Tensor(x0)
+    x1 = as_Tensor(x1)
     return Div()(x1, x0) # rdiv is the same as div but with the arguments reversed
 # Variable.__rtruediv__ = rdiv
 

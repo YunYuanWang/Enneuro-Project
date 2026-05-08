@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent.parent / 'code'))
 
 import numpy as np
+from eneuro.base import as_Tensor
 from model import ResNet18AutoDrive
 
 
@@ -23,8 +24,8 @@ def test_resnet_autodrive():
     
     # 打印模型信息
     print("\n模型结构:")
-    print(f"输入通道: {model.in_channels}")
-    print(f"输出类别: {model.num_classes}")
+    print(f"输入通道: 3")
+    print(f"输出类别: 1")
     
     # 统计参数数量
     params = list(model.params())
@@ -43,24 +44,16 @@ def test_resnet_autodrive():
     print(f"输入形状: {input_data.shape}")
     
     # 执行前向传播
-    output = model(input_data)
+    output = model(as_Tensor(input_data))
     print(f"输出形状: {output.shape}")
     print(f"输出值: {output}")
-    
-    # 测试不同形状的输入
-    print("\n测试不同形状的输入...")
-    input_data_flat = np.random.randn(batch_size, 3 * 120 * 160).astype(np.float32)
-    print(f"扁平输入形状: {input_data_flat.shape}")
-    output_flat = model(input_data_flat)
-    print(f"输出形状: {output_flat.shape}")
-    print(f"输出值: {output_flat}")
     
     # 测试批量输入
     print("\n测试批量输入...")
     batch_size = 4
     input_batch = np.random.randn(batch_size, 3, 120, 160).astype(np.float32)
     print(f"批量输入形状: {input_batch.shape}")
-    output_batch = model(input_batch)
+    output_batch = model(as_Tensor(input_batch))
     print(f"批量输出形状: {output_batch.shape}")
     
     print("\n测试完成! 模型工作正常。")

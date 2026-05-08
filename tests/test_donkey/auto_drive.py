@@ -1,60 +1,48 @@
-# 导入系统库
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent / 'code'))
+
+import os
 import cv2
 import numpy as np
 import gymnasium as gym
 import gym_donkeycar
-import paddle
-import os
 
-# 导入自定义库
-from model import AutoDriveNet
+from model import ResNet18AutoDrive
+from eneuro.utils.serializer import Serializer
+from eneuro.base import Config
+from eneuro.base.core import as_array
 
 
-# 设置模拟器环境
 env = gym.make("donkey-generated-roads-v0")
 
-# 重置当前场景
 obv = env.reset()
 
-# 设置GPU环境
-# paddle.set_device("gpu")
-paddle.set_device("cpu")
-
-# 加载训练好的模型
-model = AutoDriveNet()
+model = ResNet18AutoDrive()
 script_dir = os.path.dirname(os.path.abspath(__file__))
-model_folder = os.path.join(script_dir, "results", "model.pdparams")  # 数据集根目录
-checkpoint = paddle.load(model_folder)
-model.set_state_dict(checkpoint)
-model.eval()
+model_folder = os.path.join(script_dir, "results", "model.json")
 
-# 开始启动
-action = np.array([0, 0.2])  # 动作控制，第1个转向值，第2个油门值
+serializer = Serializer()
+serializer.load(model, model_folder)
 
-# 执行动作并获取图像
+action = np.array([0, 0.2])
+
 frame, reward, terminated, truncated, info = env.step(action)
 done = terminated or truncated
 
-# 运行2500次动作
 for t in range(2500):
-    # 图像转Tensor
-    img = paddle.to_tensor(frame.copy(), stop_gradient=True)
-    # 归一化到0~1
-    img /= 255.0
-    # 调整通道，从HWC调整为CHW
+    img = frame.astype(np.float32) / 255.0
     img = img.transpose([2, 0, 1])
-    # 扩充维度，从CHW扩充为NCHW
-    img.unsqueeze_(0)
-    # 模型推理
-    with paddle.no_grad():
-        # 前向推理获得预测的转向角度
-        prelabel = model(img).squeeze(0).cpu().detach().numpy()
-        steering_angle = prelabel[0]
-        # 执行动作并重新获取图像
-        factor = 1.5  # 动作增强因子
-        action = np.array([steering_angle * factor, 0.2])
-        frame, reward, terminated, truncated, info = env.step(action)
-        done = terminated or truncated
+    img = np.expand_dims(img, axis=0)
 
-# 运行完以后重置当前场景
+    with Config.using_config("train", False):
+        prelabel = model(img)
+        steering_angle = as_array(prelabel[0, 0])
+
+    factor = 1.5
+    action = np.array([steering_angle * factor, 0.2])
+    frame, reward, terminated, truncated, info = env.step(action)
+    done = terminated or truncated
+
 obv = env.reset()

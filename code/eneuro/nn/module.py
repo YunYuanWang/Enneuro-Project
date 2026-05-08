@@ -1,10 +1,15 @@
 import os
 import weakref
 import numpy as np
+try:
+    import cupy as cp
+    has_cupy = True
+except ImportError:
+    has_cupy = False
 from ..base import functions as F
 from ..base import *
 from ..base.parameter import Parameter
-from ..base.functions import pair
+from ..base.functions import pair, get_array_module
 from ..base.functions import depthwise_conv2d, grouped_conv2d
 from ..utils.statedict import StateDict
 
@@ -13,7 +18,8 @@ import cv2
 
 #function为方法，通用工具舍弃保存参数功能，layer为层，保存参数功能，也具备层层嵌套功能
 class Layer:
-    def __init__(self):
+    def __init__(self, device='cpu'):
+        self.device = device
         self._params = set()
     #重写setattr方法，当设置的属性是Parameter或Layer时，将属性名加入_params集合，自动识别参数和子层
     def __setattr__(self, name, value):
@@ -31,6 +37,23 @@ class Layer:
         if len(outputs) == 0:
             raise
         return outputs if len(outputs) > 1 else outputs[0]
+         
+    def to(self, device='cpu'):
+        if device == self.device:
+            return self
+        for param in self.params():
+            if param.data is None:
+                param.device = device
+            elif device in ['cuda', 'gpu']:
+                if isinstance(param.data, np.ndarray):
+                    param._data = cp.asarray(param.data)
+                param.device = 'cuda'
+            else:  # cpu
+                if has_cupy and isinstance(param.data, cp.ndarray):
+                    param._data = cp.asnumpy(param.data)
+                param.device = 'cpu'
+        self.device = device
+        return self
 
     def forward(self, inputs):
         raise NotImplementedError()
@@ -83,24 +106,36 @@ class Linear(Layer):
         self.dtype = dtype
 
         self.W = Parameter(None, name='W')
-        #初始化权重，如果指定了输入尺寸则初始化，否则在前向传播时根据输入数据动态初始化
         if self.in_size is not None:
-            self._init_W()
+            self._init_W(np)
 
         if nobias:
             self.b = None
         else:
             self.b = Parameter(np.zeros(out_size, dtype=dtype), name='b')
+    
+    def _init_params_on_device(self):
+        """初始化时根据设备类型创建参数"""
+        xp = np
+        if has_cupy and self.device in ['cuda', 'gpu']:
+            xp = cp
+        
+        if self.b is not None:
+            self.b.data = xp.array(self.b.data)
+        
+        if self.W.data is not None:
+            self.W.data = xp.array(self.W.data)
 
-    def _init_W(self):
+    def _init_W(self, xp):
         I, O = self.in_size, self.out_size
-        W_data = np.random.randn(I, O).astype(self.dtype) * np.sqrt(1 / I)
+        W_data = xp.random.randn(I, O).astype(self.dtype) * xp.sqrt(1 / I)
         self.W.data = W_data
 
     def forward(self, inputs):
         if self.W.data is None:
             self.in_size = inputs.shape[1]
-            self._init_W()
+            xp = get_array_module(inputs)
+            self._init_W(xp)
 
         y = linear(inputs, self.W, self.b)
         return y
@@ -135,24 +170,24 @@ class Conv2d(Layer):
 
         self.W = Parameter(None, name='W')
         if in_channels is not None:
-            self._init_W()
+            self._init_W(np)
 
         if nobias:
             self.b = None
         else:
             self.b = Parameter(np.zeros(out_channels, dtype=dtype), name='b')
 
-    def _init_W(self, xp=np):
+    def _init_W(self, xp):
         C, OC = self.in_channels, self.out_channels
         KH, KW = pair(self.kernel_size)
         
         if self.depthwise:
             # 深度可分离卷积的权重形状: (OC, 1, KH, KW)
-            scale = np.sqrt(1 / (C * KH * KW))
+            scale = xp.sqrt(1 / (C * KH * KW))
             W_data = xp.random.randn(OC, 1, KH, KW).astype(self.dtype) * scale
         else:
             # 普通卷积或分组卷积的权重形状: (OC, C//groups, KH, KW)
-            scale = np.sqrt(1 / ((C // self.groups) * KH * KW))
+            scale = xp.sqrt(1 / ((C // self.groups) * KH * KW))
             W_data = xp.random.randn(OC, C // self.groups, KH, KW).astype(self.dtype) * scale
         
         self.W.data = W_data
@@ -160,7 +195,8 @@ class Conv2d(Layer):
     def forward(self, inputs):
         if self.W.data is None:
             self.in_channels = inputs.shape[1]          
-            self._init_W()
+            xp = get_array_module(inputs)
+            self._init_W(xp)
 
         if self.depthwise:
             # 深度可分离卷积: 先进行逐通道卷积，再进行1x1卷积
@@ -174,12 +210,13 @@ class Conv2d(Layer):
             )
             # 1x1卷积
             if self.channel_multiplier > 1:
+                xp = get_array_module(inputs)
                 # 创建1x1卷积核
                 C = self.in_channels
                 OC = self.out_channels
                 w_shape = (OC, C, 1, 1)
-                scale = np.sqrt(1 / C)
-                w_data = np.random.randn(*w_shape).astype(self.dtype) * scale
+                scale = xp.sqrt(1 / C)
+                w_data = xp.random.randn(*w_shape).astype(self.dtype) * scale
                 w = Parameter(w_data, name='W_1x1')
                 y = conv2d(y, w, self.b, stride=1, pad=0, visualize=self.visualize)
             else:
@@ -221,24 +258,25 @@ class Deconv2d(Layer):
 
         self.W = Parameter(None, name='W')
         if in_channels is not None:
-            self._init_W()
+            self._init_W(np)
 
         if nobias:
             self.b = None
         else:
             self.b = Parameter(np.zeros(out_channels, dtype=dtype), name='b')
 
-    def _init_W(self, xp=np):
+    def _init_W(self, xp):
         C, OC = self.in_channels, self.out_channels
         KH, KW = pair(self.kernel_size)
-        scale = np.sqrt(1 / (C * KH * KW))
+        scale = xp.sqrt(1 / (C * KH * KW))
         W_data = xp.random.randn(C, OC, KH, KW).astype(self.dtype) * scale
         self.W.data = W_data
 
     def forward(self, x):
         if self.W.data is None:
             self.in_channels = x.shape[1]
-            self._init_W()
+            xp = get_array_module(x)
+            self._init_W(xp)
 
         y = deconv2d(x, self.W, self.b, self.stride, self.pad, visualize=self.visualize)
         return y
@@ -253,36 +291,34 @@ class BatchNorm(Layer):
         self.eps = eps
         self.momentum = momentum
         self.dtype = dtype
-        
-        if num_dims == 2:
-            shape = (1, num_features)
-        else:
-            shape = (1, num_features, 1, 1)
-        
-        # 参与求梯度和迭代的拉伸和偏移参数，分别初始化成1和0
-        self.gamma = Parameter(np.ones(shape, dtype=dtype), name='gamma')
-        self.beta = Parameter(np.zeros(shape, dtype=dtype), name='beta')
-        
-        # 非模型参数的变量初始化为0和1
-        self.moving_mean = np.zeros(shape, dtype=dtype)
-        self.moving_var = np.ones(shape, dtype=dtype)
+
+        # 为兼容 BatchNorm2d 后端，gamma/beta 统一使用 (C,) 形状
+        self.gamma = Parameter(np.ones(num_features, dtype=dtype), name='gamma')
+        self.beta = Parameter(np.zeros(num_features, dtype=dtype), name='beta')
+
+        # 运行统计量以 Parameter 形式保存（不参与梯度）
+        self.running_mean = Parameter(np.zeros(num_features, dtype=dtype), name='running_mean')
+        self.running_mean.requires_grad = False
+        self.running_var = Parameter(np.ones(num_features, dtype=dtype), name='running_var')
+        self.running_var.requires_grad = False
+
+        # 兼容旧属性名
+        self.moving_mean = self.running_mean.data
+        self.moving_var = self.running_var.data
 
     def forward(self, x):
-        # 使用BatchNormFunction进行前向传播
-        from ..base.functions import batch_norm
-        y = batch_norm(x, self.gamma, self.beta, self.moving_mean, self.moving_var, 
-                      self.eps, self.momentum, Config.train)
-        
-        # 更新移动平均
-        if Config.train:
-            # BatchNormFunction会更新moving_mean和moving_var
-            # 注意：这里需要从函数返回值中获取更新后的值
-            # 但由于我们的函数设计，暂时在函数内部直接更新
-            pass
-        
-        return y
+        if self.num_dims == 2:
+            n, c = x.shape
+            x_4d = x.reshape(n, c, 1, 1)
+            y_4d = batch_norm2d((x_4d, self.gamma, self.beta), self.running_mean, self.running_var, self.momentum, self.eps)
+            y = y_4d.reshape(n, c)
+        else:
+            y = batch_norm2d((x, self.gamma, self.beta), self.running_mean, self.running_var, self.momentum, self.eps)
 
-# module.py 中添加
+        # 保持旧字段同步
+        self.moving_mean = self.running_mean.data
+        self.moving_var = self.running_var.data
+        return y
 
 class BatchNorm2d(Layer):
     def __init__(self, out_channels, momentum=0.9, eps=1e-5):
@@ -305,34 +341,72 @@ class BatchNorm2d(Layer):
         y = batch_norm2d(x, self.running_mean, self.running_var, self.momentum, self.eps)
         return y
     
-class FusedConvReLU(Conv2d):
-    def forward(self, inputs):
-        if self.W.data is None:
-            self.in_channels = inputs.shape[1]          
-            self._init_W()
+class FusedConvReLU(Layer):
+    def __init__(self, out_channels, kernel_size, stride=1, pad=0, 
+                 nobias=False, dtype=np.float32, in_channels=None, visualize=False, 
+                 groups=1, depthwise=False, dilation=1):
+        super().__init__()
+        self.conv = Conv2d(out_channels, kernel_size, stride, pad, 
+                 nobias, dtype, in_channels, visualize, 
+                 groups, depthwise, dilation)
 
-        y = fused_conv_relu(inputs, self.W, self.b, self.stride, self.pad,self.visualize)
+    def forward(self, inputs):
+        if self.conv.depthwise:
+            # 深度可分离卷积: 先进行逐通道卷积，再进行1x1卷积
+            print("Warning: Not supported fusion (depthwise conv). Using not fused function.")
+            y = self.conv.forward(inputs)
+            y = relu(y)
+
+        elif self.conv.groups > 1:
+            # 分组卷积
+            print("Warning: Not supported fusion (grouped conv). Using not fused function.")
+            y = self.conv.forward(inputs)
+            y = relu(y)
+            
+        else:
+            # 普通卷积
+            y = fused_conv_relu(inputs, self.conv.W, self.conv.b, self.conv.stride, 
+                                self.conv.pad, self.conv.dilation, self.conv.visualize)
         return y
 
 class FusedConvBNReLU(Layer):
-    def __init__(self, out_channels, kernel_size, stride=1, pad=0,
-                 momentum=0.9, eps=1e-5, in_channels=None, visualize=False):
+    def __init__(self, out_channels, kernel_size, stride=1, pad=0, 
+                 nobias=False, dtype=np.float32, in_channels=None, visualize=False, 
+                 groups=1, depthwise=False, dilation=1,
+                 momentum=0.9, eps=1e-5):
         super().__init__()
         self.conv = Conv2d(out_channels, kernel_size, stride, pad, 
-                           nobias=True, in_channels=in_channels, visualize=visualize)
+                 nobias, dtype, in_channels, visualize, 
+                 groups, depthwise, dilation)
         self.bn = BatchNorm2d(out_channels, momentum, eps)
         self.visualize = visualize
 
     def forward(self, inputs):
-        # 手动调用融合函数
-        return fused_conv_bn_relu(
-            inputs, self.conv.W, self.conv.b, 
-            self.bn.gamma, self.bn.beta,
-            self.bn.running_mean, self.bn.running_var,
-            stride=self.conv.stride, pad=self.conv.pad,
-            momentum=self.bn.momentum, eps=self.bn.eps,
-            visualize=self.visualize
-        )
+        if self.conv.depthwise:
+            # 深度可分离卷积: 先进行逐通道卷积，再进行1x1卷积
+            print("Warning: Not supported fusion (depthwise conv). Using not fused function.")
+            y = self.conv.forward(inputs)
+            y = self.bn.forward(y)
+            y = relu(y)
+
+        elif self.conv.groups > 1:
+            # 分组卷积
+            print("Warning: Not supported fusion (grouped conv). Using not fused function.")
+            y = self.conv.forward(inputs)
+            y = self.bn.forward(y)
+            y = relu(y)
+            
+        else:
+            # 普通卷积
+            y = fused_conv_bn_relu(
+                inputs, self.conv.W, self.conv.b, 
+                self.bn.gamma, self.bn.beta,
+                self.bn.running_mean, self.bn.running_var,
+                stride=self.conv.stride, pad=self.conv.pad, dilation=self.conv.dilation,
+                momentum=self.bn.momentum, eps=self.bn.eps,
+                visualize=self.visualize
+            )
+        return y
 
 #由于池化层，relu函数等不需要参数，这些可以直接用function中的函数即可
 
@@ -380,10 +454,11 @@ class Module(Layer,StateDict):
                 # 无需类型判断：current_params[key]一定是Tensor
                 param = current_params[key]
                 # 恢复Tensor核心属性
-                param.data = np.array(self._from_pure_list(param_data['data']))
                 # 恢复梯度（仍是Tensor类型）
+                xp = get_array_module(param.data) if hasattr(param, 'data') and param.data is not None else np
+                param.data = xp.array(self._from_pure_list(param_data['data']))
                 if 'grad' in param_data and param_data['grad'] is not None:
-                    param.grad = Tensor(np.array(self._from_pure_list(param_data['grad'])), requires_grad=False)
+                    param.grad = Tensor(xp.array(self._from_pure_list(param_data['grad'])), requires_grad=False)
                 else:
                     param.grad = None
                 # 恢复其他属性

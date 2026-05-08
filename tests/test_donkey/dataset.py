@@ -1,9 +1,22 @@
+import sys
+from pathlib import Path
+
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent / 'code'))
+
 import numpy as np
 import cv2
-import paddle
+
+from eneuro.data.dataset import Dataset
 
 
-class AutoDriveDataset(paddle.io.Dataset):
+def preprocess_image(img):
+    """图像预处理：归一化并调整通道"""
+    img = img.astype(np.float32) / 255.0
+    img = img.transpose([2, 0, 1])
+    return img
+
+
+class AutoDriveDataset(Dataset):
     """数据集加载器"""
 
     def __init__(self, mode, transform=None):
@@ -14,11 +27,12 @@ class AutoDriveDataset(paddle.io.Dataset):
         self.mode = mode.lower()
         self.transform = transform
         assert self.mode in {"train", "val"}
-        # 读取数据集列表文件信息
+        
         if self.mode == "train":
             file_path = "./train.txt"
         else:
             file_path = "./val.txt"
+        
         self.file_list = list()
         with open(file_path, "r") as f:
             files = f.readlines()
@@ -26,23 +40,17 @@ class AutoDriveDataset(paddle.io.Dataset):
                 if file.strip() is None:
                     continue
                 self.file_list.append([file.split(" ")[0], float(file.split(" ")[1])])
+        
+        self.data = list(range(len(self.file_list)))
+        self.label = [self.file_list[i][1] for i in range(len(self.file_list))]
+        self.prepare()
 
-    def __getitem__(self, i):
-        """
-        :参数 i: 图像检索号
-        :返回: 返回第i个图像和转向值
-        """
-        # 读取图像
-        img = cv2.imread(self.file_list[i][0])
+    def __getitem__(self, index):
+        img = cv2.imread(self.file_list[index][0])
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        # 预处理
+        
         if self.transform:
             img = self.transform(img)
-        # 读取转向值
-        label = self.file_list[i][1]
-        label = paddle.to_tensor(np.array([label]), dtype="float32")
+        
+        label = np.array([self.file_list[index][1]], dtype=np.float32)
         return img, label
-
-    def __len__(self):
-        """返回: 图像总数"""
-        return len(self.file_list)
