@@ -252,7 +252,7 @@ def train_lenet_local_fixed():
     print("开始使用本地MNIST文件训练LeNet...")
     
     # 1. 加载数据
-    data_dir = "D:\\gzs\\gitHub\\Enneuro-Project\\code\\tests\\testdata\\MNIST_data"
+    data_dir = "code\\tests\\testdata\\MNIST_data"
     pkl_path = Path(data_dir) / "mnist.pkl"
     
     if pkl_path.exists():
@@ -334,7 +334,8 @@ def train_lenet_local_fixed():
         test_loader, 
         epochs=1,
         batch_size=batch_size,
-        verbose=True
+        verbose=True,
+        device='cuda'
     )
     
     # 10. 最终评估

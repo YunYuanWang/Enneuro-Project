@@ -70,11 +70,17 @@ class Visualizer:
     def update_predictions(self, y_true, y_pred):
         """更新预测结果，用于绘制混淆矩阵"""
         # 确保输入是 numpy 数组
-        if not isinstance(y_true, np.ndarray):
+        # 如果是cupy数组，使用.get()方法转换
+        if hasattr(y_true, 'get'):
+            y_true = y_true.get()
+        elif not isinstance(y_true, np.ndarray):
             y_true = y_true.data if hasattr(y_true, 'data') else np.array(y_true)
-        if not isinstance(y_pred, np.ndarray):
+
+        if hasattr(y_pred, 'get'):
+            y_pred = y_pred.get()
+        elif not isinstance(y_pred, np.ndarray):
             y_pred = y_pred.data if hasattr(y_pred, 'data') else np.array(y_pred)
-        
+
         self.y_true.extend(y_true.flatten())
         self.y_pred.extend(y_pred.flatten())
     
@@ -111,7 +117,24 @@ class Visualizer:
         
         # 4. 绘制混淆矩阵
         if len(self.y_true) > 0 and len(self.y_pred) > 0:
-            cm = confusion_matrix(self.y_true, self.y_pred)
+            # 将列表中的cupy数组转换为numpy数组
+            # 如果列表中的元素是cupy数组，需要逐个转换
+            y_true_list = []
+            for item in self.y_true:
+                if hasattr(item, 'get'):
+                    y_true_list.append(item.get())
+                else:
+                    y_true_list.append(item)
+            y_pred_list = []
+            for item in self.y_pred:
+                if hasattr(item, 'get'):
+                    y_pred_list.append(item.get())
+                else:
+                    y_pred_list.append(item)
+
+            y_true_np = np.array(y_true_list)
+            y_pred_np = np.array(y_pred_list)
+            cm = confusion_matrix(y_true_np, y_pred_np)
             sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[1, 1])
             axes[1, 1].set_title('Confusion Matrix')
             axes[1, 1].set_xlabel('Predicted Label')

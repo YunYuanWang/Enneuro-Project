@@ -2,6 +2,20 @@ from ..base import Tensor,Parameter
 from ..utils import StateDict
 import numpy as np
 from typing import Any
+try:
+    import cupy as cp
+    has_cupy = True
+except ImportError:
+    has_cupy = False
+
+def get_array_module(x):
+    """获取数组所在的模块（numpy或cupy）"""
+    if isinstance(x, np.ndarray):
+        return np
+    elif has_cupy and isinstance(x, cp.ndarray):
+        return cp
+    else:
+        return np
 
 LR_KEY = 'lr'
 M_KEY = 'm'
@@ -64,19 +78,19 @@ class Optimizer(StateDict):
                 for idx, arr in v.items():
                     # 'key': {'idx': list} -> 'key': {'idx': ndarray}
                     if isinstance(arr, list):
-                        new_state[k][idx] = np.array(arr)
+                        xp = np
+                        if self.params and len(self.params) > 0:
+                            xp = get_array_module(self.params[0].data)
+                        new_state[k][idx] = xp.array(arr)
                     else:
                         new_state[k][idx] = arr
             else:
                 new_state[k] = v
         self._state = new_state
 
-    def _apply_regularization(self, param: Parameter, grad_data: np.ndarray) -> np.ndarray:
+    def _apply_regularization(self, param: Parameter, grad_data) -> np.ndarray:
         if param.name != 'W':
             return grad_data  # 只对权重进行正则化
-        
-        #print(param.name)
-
         """应用正则化到梯度"""
         l2_lambda = self._state.get(L2_LAMBDA_KEY, 0.0)
         l1_lambda = self._state.get(L1_LAMBDA_KEY, 0.0)
@@ -84,6 +98,8 @@ class Optimizer(StateDict):
         # L2正则化 (权重衰减)
         # Loss = Loss + l2_lambda * ||w||^2
         # dLoss/dw = dLoss/dw + 2 * l2_lambda * w
+        xp = get_array_module(grad_data)
+        
         if l2_lambda > 0:
             grad_data += 2 * l2_lambda * param.data
         
@@ -92,7 +108,8 @@ class Optimizer(StateDict):
         # dLoss/dw = dLoss/dw + l1_lambda * sign(w)
         if l1_lambda > 0:
             # 使用次梯度处理0值
-            sign = np.sign(param.data)
+            
+            sign = xp.sign(param.data)
             sign[param.data == 0] = 0  # 在0处，次梯度可以是[-1, 1]之间的任意值，通常取0
             grad_data += l1_lambda * sign
         
@@ -112,7 +129,8 @@ class SGD(Optimizer):
             grad = self._apply_regularization(param, param.grad.data)
             param.grad.data = grad
 
-            param.data -= self._state[LR_KEY] * param.grad.data
+            xp = get_array_module(param.data)
+            param.data -= xp.array(self._state[LR_KEY]) * param.grad.data
             
             '''
             print(type(param.grad.data))
@@ -133,21 +151,34 @@ class MomentumSGD(Optimizer):
 
     def step(self):
         _lr, _m = self._state[LR_KEY], self._state[M_KEY]
-        _vdict: dict[str,np.ndarray] = self._state[V_KEY]
+        _vdict = self._state[V_KEY]
 
         for idx in range(len(self.params)):
             param = self.params[idx]
             if param.grad is None:
                 continue
 
+            xp = get_array_module(param.data)
+
             # 应用正则化
             grad = self._apply_regularization(param, param.grad.data)
-            param.grad.data = grad
 
-            _v = _vdict.get(str(idx), np.zeros_like(param.data))
+            # 将grad和标量转换为与xp匹配的类型
+            if xp is not np:
+                grad = xp.asarray(grad)
+                _lr = xp.asarray(_lr)
+                _m = xp.asarray(_m)
+            else:
+                grad = np.asarray(grad)
+
+            _v = _vdict.get(str(idx), xp.zeros_like(param.data))
+
+            # 确保_v是正确类型的数组（与xp匹配）
+            if xp is not np and isinstance(_v, np.ndarray):
+                _v = xp.asarray(_v)
 
             # v = v*m - lr*grad
-            _v = _v * _m - _lr * param.grad.data
+            _v = _v * _m - _lr * grad
             # w = w + v
             param.data += _v
 
@@ -169,8 +200,8 @@ class Adam(Optimizer):
 
     def step(self):
         _lr, _b1, _b2, _eps = self._state[LR_KEY], self._state[BETA1_KEY], self._state[BETA2_KEY], self._state[EPS_KEY]
-        _vdict: dict[str,np.ndarray] = self._state[V_KEY]
-        _sdict: dict[str,np.ndarray] = self._state[S_KEY]
+        _vdict = self._state[V_KEY]
+        _sdict = self._state[S_KEY]
 
         self._state[T_KEY] += 1
         _t = self._state[T_KEY]
@@ -180,23 +211,44 @@ class Adam(Optimizer):
             if param.grad is None:
                 continue
 
+            xp = get_array_module(param.data)
+
             # 应用正则化
             grad = self._apply_regularization(param, param.grad.data)
-            param.grad.data = grad
 
-            _v = _vdict.get(str(idx), np.zeros_like(param.data))
-            _s = _sdict.get(str(idx), np.zeros_like(param.data))
+            # 将grad和标量转换为与xp匹配的类型
+            if xp is not np:
+                grad = xp.asarray(grad)
+                _lr = xp.asarray(_lr)
+                _b1 = xp.asarray(_b1)
+                _b2 = xp.asarray(_b2)
+                _eps = xp.asarray(_eps)
+                one_minus_b1 = xp.asarray(1) - _b1
+                one_minus_b2 = xp.asarray(1) - _b2
+            else:
+                one_minus_b1 = 1 - _b1
+                one_minus_b2 = 1 - _b2
+
+            _v = _vdict.get(str(idx), xp.zeros_like(param.data))
+            _s = _sdict.get(str(idx), xp.zeros_like(param.data))
+
+            # 确保_v和_s是正确类型的数组（与xp匹配）
+            if xp is not np:
+                if isinstance(_v, np.ndarray):
+                    _v = xp.asarray(_v)
+                if isinstance(_s, np.ndarray):
+                    _s = xp.asarray(_s)
 
             # v = v*beta1 + (1-beta1)*grad
-            _v = _v * _b1 + (1-_b1) * param.grad.data
+            _v = _v * _b1 + one_minus_b1 * grad
             # s = s*beta2 + (1-beta2)*grad*grad
-            _s = _s * _b2 + (1-_b2 ) * np.power(param.grad.data, 2)
+            _s = _s * _b2 + one_minus_b2 * xp.power(grad, 2)
 
             # 计算修正
             v_hat = _v / (1 - _b1 ** _t)
             s_hat = _s / (1 - _b2 ** _t)
 
             # w = w - lr*v / sqrt(s + eps)
-            param.data -= _lr * v_hat / np.sqrt(s_hat + _eps)
+            param.data -= _lr * v_hat / xp.sqrt(s_hat + _eps)
 
             self._state[V_KEY][str(idx)], self._state[S_KEY][str(idx)] = _v, _s

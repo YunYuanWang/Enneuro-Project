@@ -1,6 +1,12 @@
 import numpy as np
+try:
+    import cupy as cp
+    has_cupy = True
+except ImportError:
+    has_cupy = False
 from ..base import Tensor
 from ..base import as_Tensor
+from ..base.functions import get_array_module
 # from .meters import TimeMeter, AverageMeter
 from ..base import Config
 
@@ -73,14 +79,24 @@ class Trainer:
 
 
     def fit(self, train_loader, val_loader, epochs=10, batch_size=32, 
-                verbose=True, device='cpu'):
+                verbose=True, device='cpu', start_epoch=0, checkpoint_path=None, serializer=None):
         """
             only accept DataLoader object
             if you need to split train/val dataset, please do it outside this function
         """
-        # self.model.to(device)
+        self.model = self.model.to(device)
+        
+        if verbose:
+            # 从 model 中随机抓取一个参数判断其类型以确认训练设备
+            for param in self.model.params():
+                if param.data is not None:
+                    if has_cupy and isinstance(param.data, cp.ndarray):
+                        print(f"using cuda to train")
+                    else:
+                        print(f"using cpu to train")
+                    break
 
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             if verbose:
                 print(f"======================= Epoch #{epoch+1}/{epochs} - Start training =======================")
             self._epoch = epoch
@@ -102,6 +118,12 @@ class Trainer:
             # 使用visualizer更新epoch时间
             if self.visualizer is not None:
                 self.visualizer.update_epoch(epoch_time)
+            
+            # 保存checkpoint
+            if checkpoint_path and serializer:
+                serializer.save_checkpoint(self.model, self.optimizer, epoch, checkpoint_path)
+                if verbose:
+                    print(f"Checkpoint saved to {checkpoint_path}")
             
             # 早停
             # if self.enable_early_stop:
@@ -134,8 +156,8 @@ class Trainer:
         for batch_idx, (Xb, yb) in enumerate(data_loader):
             Xb = as_Tensor(Xb)
             yb = as_Tensor(yb)
-            # Xb = Xb.to(device)
-            # yb = yb.to(device)
+            Xb = Xb.to(device)
+            yb = yb.to(device)
             y_hat = self.model(Xb)
 
             # 兼容单标签分类与多标签分类
@@ -224,12 +246,12 @@ class Evaluator:
         if verbose:
             print(f"======================= Start evaluation =======================")
 
-        # self.model.to(device)
+        self.model = self.model.to(device)
         for batch_idx, (Xb, yb) in enumerate(data_loader):
             Xb = as_Tensor(Xb)
             yb = as_Tensor(yb)
-            # Xb = Xb.to(device)
-            # yb = yb.to(device)
+            Xb = Xb.to(device)
+            yb = yb.to(device)
 
             with Config.using_config('train', False):
                 y_hat = self.model(Xb)
