@@ -130,6 +130,7 @@ def reshape(x, shape):
 
 class Transpose(Function):
     def __init__(self,axes = None):
+        super().__init__()
         self.axes = axes
     def forward(self,*xs):
         xs=xs[0]
@@ -227,9 +228,11 @@ def sum (x,axis = None,keepdims = False):
 
 class Mean(Function):
     def __init__ (self,axis,keepdims,visualize=False):
+        super().__init__()
         self.axis = axis
         self.keepdims = keepdims
         self.visualize = visualize
+
     def forward (self,*xs):
         xs=xs[0]
         self.x_shape = xs.shape
@@ -294,6 +297,7 @@ def sum_to(x, shape):
 
 class BroadcastTo(Function):
     def __init__ (self,shape,visualize=False):
+        super().__init__()
         self.visualize = visualize
         self.shape = shape
     def forward (self,*xs):
@@ -319,6 +323,9 @@ def average(x, axis=None, keepdims=False):
 
 
 class MatMul(Function):
+    def __init__(self):
+        super().__init__()
+
     def forward(self, *xs):
         """
         矩阵乘法的前向传播。
@@ -379,6 +386,7 @@ class Linear(Function):
             - 需要先将x转换为cupy数组，然后才能执行dot操作
         """
         x = xs[0]
+        #print(f"x.dtype = {x.dtype}")
         w = xs[1]
         b = xs[2]
 
@@ -446,6 +454,7 @@ def relu(x):
 
 class Softmax(Function):
     def __init__(self, axis=1,visualize=False):
+        super().__init__()
         self.axis = axis
         self.visualize = visualize
 
@@ -526,8 +535,8 @@ def min(x, axis=None, keepdims=False):
 
 #准备函数1#
 #反卷积输出尺寸，即前向传播输入的未填充的尺寸
-def get_deconv_outsize(size, k, s, p):
-    return s * (size - 1) + k - 2 * p
+def get_deconv_outsize(size, k, s, p, dilation=1):
+    return s * (size - 1) + (k - 1) * dilation + 1 - 2 * p
 
 #卷积输出尺寸，即前向传播输出的尺寸
 def get_conv_outsize(input_size, kernel_size, stride, pad, dilation=1):
@@ -689,13 +698,14 @@ def im2col_array(img, kernel_size, stride, pad, to_matrix=True, dilation=1, xp=N
     return col
 
 
-def col2im_array(col, img_shape, kernel_size, stride, pad, to_matrix=True):
+def col2im_array(col, img_shape, kernel_size, stride, pad, to_matrix=True, dilation=(1,1)):
     N, C, H, W = img_shape
     KH, KW = pair(kernel_size)
     SH, SW = pair(stride)
     PH, PW = pair(pad)
-    OH = get_conv_outsize(H, KH, SH, PH)
-    OW = get_conv_outsize(W, KW, SW, PW)
+    DH, DW = pair(dilation)
+    OH = get_conv_outsize(H, KH, SH, PH, DH)
+    OW = get_conv_outsize(W, KW, SW, PW, DW)
 
     # Ensure `col` has shape (N, C, KH, KW, OH, OW)
     if to_matrix:
@@ -713,10 +723,10 @@ def col2im_array(col, img_shape, kernel_size, stride, pad, to_matrix=True):
     #         i_start = ow * SW
     #         img[:, :, j_start:j_start+KH, i_start:i_start+KW] += col[:, :, :, :, oh, ow]
     for j in range(KH):
-        j_lim = j + SH * OH
+        j_lim = j * DH + SH * OH
         for i in range(KW):
-            i_lim = i + SW * OW
-            img[:, :, j:j_lim:SH, i:i_lim:SW] += col[:, :, j, i, :, :]
+            i_lim = i * DW + SW * OW
+            img[:, :, j*DH:j_lim:SH, i*DW:i_lim:SW] += col[:, :, j, i, :, :]
     return img[:, :, PH:H + PH, PW:W + PW]
 
 
@@ -774,6 +784,7 @@ class Conv2d(Function):
 
     def forward(self, *xs):
         x = xs[0]
+        #print(f"x.dtype = {x.dtype}")
         W = xs[1]
         b = xs[2]
         self._fw_workspace = None
@@ -1577,11 +1588,12 @@ def depthwise_conv2d(x, W, b=None, stride=(1,1), pad=(0,0), dilation=1, visualiz
 
 
 class Deconv2d(Function):
-    def __init__(self, stride=(1,1), pad=(0,0), outsize=None,visualize=False):
+    def __init__(self, stride=(1,1), pad=(0,0), outsize=None, dilation=1, visualize=False):
         super().__init__()
         self.stride = pair(stride)
         self.pad = pair(pad)
         self.outsize = outsize
+        self.dilation = pair(dilation)
         self.visualize = visualize
 
 
@@ -1607,6 +1619,7 @@ class Deconv2d(Function):
         Weight = W
         SH, SW = self.stride
         PH, PW = self.pad
+        DH, DW = self.dilation
         C, OC, KH, KW = Weight.shape
         N, C, H, W_in = x.shape
         if self.outsize is None:
@@ -1638,7 +1651,7 @@ class Deconv2d(Function):
         x, W, b = self.inputs
 
         # ==== gx ====
-        gx = conv2d(gys, W, b=None, stride=self.stride, pad=self.pad)
+        gx = conv2d(gys, W, b=None, stride=self.stride, pad=self.pad, dilation=self.dilation)
         # ==== gW ====
         gW = Conv2DGradW(self)(gys, x)
         # ==== gb ====
@@ -1648,8 +1661,8 @@ class Deconv2d(Function):
         return gx, gW, gb
 
 
-def deconv2d(x, W, b=None, stride=(1,1), pad=(0,0), outsize=None,visualize=False):
-    return Deconv2d(stride, pad, outsize,visualize)(x, W, b)
+def deconv2d(x, W, b=None, stride=(1,1), pad=(0,0), outsize=None, dilation=1, visualize=False):
+    return Deconv2d(stride, pad, outsize, dilation, visualize)(x, W, b)
 
 
 class Conv2DGradW(Function):
@@ -1825,9 +1838,6 @@ def average_pooling(x, kernel_size, stride=1, pad=0):
     return AveragePooling(kernel_size, stride, pad)(x)
 
 class GlobalAveragePooling(Function):
-    def __init__(self):
-        super().__init__()
-    
     def forward(self, *xs):
         x = xs[0]
         self.input_shape = x.shape
@@ -1986,6 +1996,7 @@ class BatchNorm2d(Function):
         # x: (N, C, H, W)
         # gamma, beta: (C,)
         x, gamma, beta = xs
+        #print(f"x.dtype = {x.dtype}")
         N, C, H, W = x.shape
         self.x_shape = x.shape
         self.x = x
@@ -2145,7 +2156,8 @@ class FusedConvBNReLU(Function):
     前向：卷积 → 批量归一化 → ReLU
     反向：ReLU 梯度 → BN 梯度 → 卷积梯度
     """
-    def __init__(self, stride=(1,1), pad=(0,0), dilation=(1,1), running_mean=None, running_var=None, momentum=0.9, eps=1e-5, visualize=False):
+    def __init__(self, stride=(1,1), pad=(0,0), dilation=(1,1),
+                  running_mean=None, running_var=None, momentum=0.9, eps=1e-5, visualize=False):
         super().__init__()
         self.stride = pair(stride)
         self.pad = pair(pad)
@@ -2314,3 +2326,65 @@ class FusedConvBNReLU(Function):
     
 def fused_conv_bn_relu(x, W, b, gamma, beta, running_mean, running_var, stride=1, pad=0, dilation=1, momentum=0.9, eps=1e-5, visualize=False):
     return FusedConvBNReLU(stride, pad, dilation, running_mean, running_var, momentum, eps, visualize)(x, W, b, gamma, beta)
+
+class CastRigistry:
+    '''
+    注册自动精度
+    resist_cast: 从Config.current_dtype提高到np.float32
+    cancast: 降低精度至Config.current_dtype (一般是np.float16)
+    '''
+    cancast = [
+        Tanh,
+        MatMul,
+        Linear,
+        Sigmoid,
+        ReLU,
+        Conv2d,
+        GroupedConv2d,
+        Deconv2d,
+        Pooling,
+        AveragePooling,
+        GlobalAveragePooling,
+        FusedConvReLU
+    ]
+
+    resist_cast = [
+        Sin,
+        Cos,
+        Exp,
+        Log,
+        Mean,
+        Softmax,
+        BatchNorm2d,
+        FusedConvBNReLU
+    ]
+
+class Cast(Function):
+    def forward(self, *xs):
+        # 降低精度
+        current_dtype = Config.current_dtype
+        xs = [x.astype(current_dtype) if x.dtype != current_dtype 
+                  else x 
+                  for x in xs]
+        return tuple(xs)
+
+    def backward(self, gys):
+        return gys
+
+def cast(x):
+    return Cast()(*x)
+
+class DeCast(Function):
+    def forward(self, *xs):
+        # 提高精度
+        current_dtype = Config.current_dtype
+        xs = [x.astype(np.float32) if x.dtype == current_dtype 
+                  else x 
+                  for x in xs]
+        return tuple(xs)
+
+    def backward(self, gys):
+        return gys
+
+def decast(x):
+    return DeCast()(*x)
