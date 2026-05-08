@@ -330,7 +330,7 @@ def main():
     default_best_ckpt = Path(__file__).resolve().parent / 'checkpoints' / 'resnet18_donkeycar_best_checkpoint.json'
 
     parser = argparse.ArgumentParser(description='DonkeyCar图像转向角回归训练 (ResNet18)')
-    parser.add_argument('--data-dir', type=str, default=None, help='数据目录，默认自动查找')
+    parser.add_argument('--data-dir', type=str, default='D:/Data/data', help='数据目录，默认自动查找')
     parser.add_argument('--epochs', type=int, default=4)
     parser.add_argument('--batch-size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=0.001)

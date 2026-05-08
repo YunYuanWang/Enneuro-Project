@@ -245,7 +245,7 @@ class Conv2d(Layer):
 # 转置卷积层
 class Deconv2d(Layer):
     def __init__(self, out_channels, kernel_size, stride=1,
-                 pad=0, nobias=False, dtype=np.float32, in_channels=None, visualize=False):
+                 pad=0, dilation=1, nobias=False, dtype=np.float32, in_channels=None, visualize=False):
   
         super().__init__()
         self.in_channels = in_channels
@@ -253,6 +253,7 @@ class Deconv2d(Layer):
         self.kernel_size = kernel_size
         self.stride = stride
         self.pad = pad
+        self.dilation = dilation
         self.dtype = dtype
         self.visualize = visualize
 
@@ -278,7 +279,7 @@ class Deconv2d(Layer):
             xp = get_array_module(x)
             self._init_W(xp)
 
-        y = deconv2d(x, self.W, self.b, self.stride, self.pad, visualize=self.visualize)
+        y = deconv2d(x, self.W, self.b, self.stride, self.pad, dilation=self.dilation, visualize=self.visualize)
         return y
 
 from ..base import Config
@@ -321,19 +322,19 @@ class BatchNorm(Layer):
         return y
 
 class BatchNorm2d(Layer):
-    def __init__(self, out_channels, momentum=0.9, eps=1e-5):
+    def __init__(self, out_channels, momentum=0.9, eps=1e-5, dtype=np.float32):
         super().__init__()
         self.out_channels = out_channels
         self.momentum = momentum
         self.eps = eps
 
         # 可训练参数 γ 和 β
-        self.gamma = Parameter(np.ones(out_channels, dtype=np.float32), name='gamma')
-        self.beta  = Parameter(np.zeros(out_channels, dtype=np.float32), name='beta')
+        self.gamma = Parameter(np.ones(out_channels, dtype=dtype), name='gamma')
+        self.beta  = Parameter(np.zeros(out_channels, dtype=dtype), name='beta')
         # 不可训练的运行统计量（仍用 Tensor 存储，但 requires_grad=False）
-        self.running_mean = Parameter(np.zeros(out_channels, dtype=np.float32), name='running_mean')
+        self.running_mean = Parameter(np.zeros(out_channels, dtype=dtype), name='running_mean')
         self.running_mean.requires_grad=False
-        self.running_var  = Parameter(np.ones(out_channels, dtype=np.float32), name='running_var')
+        self.running_var  = Parameter(np.ones(out_channels, dtype=dtype), name='running_var')
         self.running_var.requires_grad=False
 
     def forward(self, inputs):
