@@ -3,7 +3,53 @@ from .core import Tensor
 from .core import as_Tensor, as_array
 from .core import Function
 import numpy as np
+try:
+    import cupy as cp
+    has_cupy = True
+except ImportError:
+    has_cupy = False
+
 from .core import Config
+
+
+def get_array_module(arr):
+    """获取数组对应的计算模块 (numpy 或 cupy)"""
+    if isinstance(arr, Tensor):
+        return get_array_module(arr.data)
+    if isinstance(arr, np.ndarray):
+        return np
+    elif has_cupy and isinstance(arr, cp.ndarray):
+        return cp
+    else:
+        return np
+
+
+def to_xp(arr, xp):
+    """
+    将数组arr转换为xp对应的类型。
+
+    Args:
+        arr: 输入数组（可以是numpy数组、cupy数组或Tensor）
+        xp: 目标数组模块（numpy或cupy）
+
+    Returns:
+        转换后的数组
+
+    Notes:
+        - 当目标是numpy但arr是cupy数组时，使用cp.asnumpy()转换
+        - 当目标是cupy但arr是numpy数组时，使用cp.asarray()转换
+        - 如果arr已经是目标类型，则不进行转换
+    """
+    if isinstance(arr, Tensor):
+        arr = arr.data
+    if xp is np:
+        if has_cupy and isinstance(arr, cp.ndarray):
+            return cp.asnumpy(arr)
+        return arr
+    else:  # xp is cp
+        if isinstance(arr, np.ndarray):
+            return cp.asarray(arr)
+        return arr
 
 '''
 other functions
@@ -12,35 +58,42 @@ other functions
 class Sin(Function):
     def forward(self, *xs):
         xs = xs[0]
-        return np.sin(xs)
+        xp = get_array_module(xs)
+        return xp.sin(xs)
 
     def backward(self, gys):
         x = self.inputs[0].data
-        gx = gys * np.cos(x)
+        xp = get_array_module(x)
+        gx = gys * xp.cos(x)
         return gx
     
 class Cos(Function):
     def forward(self,*xs):
         xs = xs[0]
-        return np.cos(xs)
+        xp = get_array_module(xs)
+        return xp.cos(xs)
     def backward(self, gys):
         x = self.inputs[0].data
-        gx = gys * -np.sin(x)
+        xp = get_array_module(x)
+        gx = gys * -xp.sin(x)
         return gx
 
 class Exp(Function):
     def forward(self,*xs):
         xs = xs[0]
-        return np.exp(xs)
+        xp = get_array_module(xs)
+        return xp.exp(xs)
     def backward(self, gys):
         x = self.inputs[0].data
-        gx = gys * np.exp(x)
+        xp = get_array_module(x)
+        gx = gys * xp.exp(x)
         return gx
 
 class Tanh(Function):
     def forward(self,*xs):
         xs=xs[0]
-        return np.tanh(xs)
+        xp = get_array_module(xs)
+        return xp.tanh(xs)
     def backward(self, gys):
         y = self.outputs[0].data
         gx = gys * (1 - y**2)
@@ -49,7 +102,8 @@ class Tanh(Function):
 class Log(Function):
     def forward(self,*xs):
         xs=xs[0]
-        return np.log(xs)
+        xp = get_array_module(xs)
+        return xp.log(xs)
     def backward(self, gys):
         x = self.inputs[0].data
         gx = gys / x
@@ -114,7 +168,8 @@ class GetItemGrad(Function):
         self.visualize = visualize
     def forward (self,*xs):
         xs=xs[0]
-        gx = np.zeros(self.x_shape)
+        xp = get_array_module(xs)
+        gx = xp.zeros(self.x_shape)
         gx[self.slices] = xs
         return gx
     #切片操作的反向传播
@@ -248,7 +303,8 @@ class BroadcastTo(Function):
     def forward (self,*xs):
         xs=xs[0]
         self.x_shape = xs.shape
-        return np.broadcast_to(xs,self.shape)
+        xp = get_array_module(xs)
+        return xp.broadcast_to(xs,self.shape)
     def backward (self,gys):
         return sum_to(gys,self.x_shape)
   
@@ -271,9 +327,32 @@ class MatMul(Function):
         super().__init__()
 
     def forward(self, *xs):
+        """
+        矩阵乘法的前向传播。
+
+        Args:
+            x: 输入数据，形状 (N, M)
+            W: 权重，形状 (M, K)
+
+        Returns:
+            输出数据，形状 (N, K)
+
+        GPU适配说明:
+            - 优先从权重W获取数组模块类型
+            - 当W是cupy数组时，需要先将x转换为cupy数组
+        """
         x = xs[0]
         W = xs[1]
-        y = x.dot(W)
+
+        # 关键修复：优先从权重W获取数组模块，而非输入x
+        W_data = W.data if isinstance(W, Tensor) else W
+        xp = get_array_module(W_data)
+
+        # 如果x不是xp类型的数组，需要先转换
+        # 使用to_xp辅助函数正确处理numpy/cupy之间的转换
+        x_data = to_xp(x, xp)
+
+        y = x_data.dot(W_data)
         return y
 
     def backward(self, gys):
@@ -289,16 +368,43 @@ def matmul(x, W):
 ##线性变换函数###
 
 class Linear(Function):
-    def forward(self,*xs):
+    def forward(self, *xs):
+        """
+        线性变换的前向传播（矩阵乘法）。
+
+        Args:
+            x: 输入数据，形状 (N, in_features)
+            w: 权重，形状 (in_features, out_features)
+            b: 偏置，形状 (out_features,)，可为None
+
+        Returns:
+            输出数据，形状 (N, out_features)
+
+        GPU适配说明:
+            - 优先从权重w获取数组模块类型，因为输出格式由权重决定
+            - 当模型在GPU上但输入数据还在CPU上时，w会是cupy数组
+            - 需要先将x转换为cupy数组，然后才能执行dot操作
+        """
         x = xs[0]
         #print(f"x.dtype = {x.dtype}")
         w = xs[1]
         b = xs[2]
-        y = x.dot(w)
+
+        # 关键修复：优先从权重w获取数组模块，而非输入x
+        # 这样可以确保当x是numpy但w是cupy时，使用cupy进行计算
+        w_data = w.data if isinstance(w, Tensor) else w
+        xp = get_array_module(w_data)
+
+        # 如果x不是xp类型的数组，需要先转换
+        # 使用to_xp辅助函数正确处理numpy/cupy之间的转换
+        x_data = to_xp(x, xp)
+
+        y = x_data.dot(w_data)
         if b is None:
             return y
         else:
-            return y + b 
+            b_data = to_xp(b, xp)
+            return y + b_data 
     def backward (self,gys):
         x,w,b = self.inputs
         gx = matmul(gys,w.T)
@@ -316,7 +422,8 @@ def linear(x, W, b=None):
 class Sigmoid(Function):
     def forward(self, *xs):
         x = xs[0]
-        y = np.tanh(x * 0.5) * 0.5 + 0.5  #使用numpy函数而非自定义函数
+        xp = get_array_module(x)
+        y = xp.tanh(x * 0.5) * 0.5 + 0.5  #使用numpy/cupy函数而非自定义函数
         return y
 
     def backward(self, gys):
@@ -331,8 +438,8 @@ def sigmoid(x):
 class ReLU(Function):
     def forward(self, *xs):
         x = xs[0]
-        #print(f"x.dtype = {x.dtype}")
-        y = np.maximum(x, 0.0)
+        xp = get_array_module(x)
+        y = xp.maximum(x, 0.0)
         return y
 
     def backward(self, gys):
@@ -353,8 +460,9 @@ class Softmax(Function):
 
     def forward(self, *xs):
         x = xs[0]
+        xp = get_array_module(x)
         y = x - x.max(axis=self.axis, keepdims=True)
-        y = np.exp(y)
+        y = xp.exp(y)
         y /= y.sum(axis=self.axis, keepdims=True)
         return y
 
@@ -517,7 +625,31 @@ class Col2im(Function):
 def col2im(x, input_shape, kernel_size, stride=(1,1), pad=(0,0), to_matrix=True):
     return Col2im(input_shape, kernel_size, stride, pad, to_matrix)(x)
 
-def im2col_array(img, kernel_size, stride, pad, to_matrix=True, dilation=(1,1)):
+def im2col_array(img, kernel_size, stride, pad, to_matrix=True, dilation=1, xp=None):
+    """
+    将图像转换为列矩阵（im2col操作），用于卷积操作。
+
+    Args:
+        img: 输入图像，形状为 (N, C, H, W) 的4D张量
+        kernel_size: 卷积核大小
+        stride: 步长
+        pad: 填充大小
+        to_matrix: 是否将输出转换为矩阵形式
+        dilation: 扩张率（空洞卷积）
+        xp: 指定数组模块（numpy或cupy），如果为None则自动从img推断
+
+    Returns:
+        转换后的列矩阵
+
+    Notes:
+        - 支持CPU（numpy）和GPU（cupy）两种后端
+        - 当指定xp参数时，优先使用指定的数组模块进行计算
+        - 这对于GPU训练至关重要，因为输入img可能是numpy数组而权重W是cupy数组
+        - 如果xp与img的实际类型不匹配，需要先将img转换为xp对应的类型
+    """
+    # 如果传入的是 Tensor，提取底层数据
+    if isinstance(img, Tensor):
+        img = img.data
 
     N, C, H, W = img.shape
     KH, KW = pair(kernel_size)
@@ -527,11 +659,32 @@ def im2col_array(img, kernel_size, stride, pad, to_matrix=True, dilation=(1,1)):
     OH = get_conv_outsize(H, KH, SH, PH, DH)
     OW = get_conv_outsize(W, KW, SW, PW, DW)
 
-    # CPU-only implementation (use NumPy). Pad and extract patches.
-    img = np.pad(img,
+    # 关键修复：优先使用传入的xp参数，而非从img推断
+    # 这样可以确保当img是numpy但权重是cupy时，使用cupy进行计算
+    if xp is None:
+        xp = get_array_module(img)
+    else:
+        # 当指定了xp但img类型不匹配时，需要先将img转换为xp对应的类型
+        # 注意：img可能是Tensor对象，需要先提取其data
+        img_data = img.data if isinstance(img, Tensor) else img
+        img_xp = get_array_module(img_data)
+        if img_xp != xp:
+            # 根据目标xp模块正确转换数组类型
+            # 当xp是numpy但img是cupy时，需要使用cupy.asnumpy()
+            # 当xp是cupy但img是numpy时，需要使用cupy.asarray()
+            if xp is np:
+                # 目标xp是numpy，源是cupy
+                img_data = cp.asnumpy(img_data)
+            else:
+                # 目标xp是cupy，源是numpy
+                img_data = xp.asarray(img_data)
+        img = img_data
+
+    # CPU/GPU实现：使用NumPy/CuPy进行填充和patch提取
+    img = xp.pad(img,
                  ((0, 0), (0, 0), (PH, PH + SH - 1), (PW, PW + SW - 1)),
                  mode='constant', constant_values=(0,))
-    col = np.ndarray((N, C, KH, KW, OH, OW), dtype=img.dtype)
+    col = xp.ndarray((N, C, KH, KW, OH, OW), dtype=img.dtype)
     # 计算每个patch在输入图像中的位置，支持扩张卷积
     for j in range(KH):
         j_lim = j * DH + SH * OH
@@ -557,9 +710,10 @@ def col2im_array(col, img_shape, kernel_size, stride, pad, to_matrix=True, dilat
     # Ensure `col` has shape (N, C, KH, KW, OH, OW)
     if to_matrix:
         col = col.reshape(N, OH, OW, C, KH, KW).transpose(0, 3, 4, 5, 1, 2)
-
+        
+    xp = get_array_module(col)
     
-    img = np.zeros((N, C, H + 2 * PH + SH - 1, W + 2 * PW + SW - 1),
+    img = xp.zeros((N, C, H + 2 * PH + SH - 1, W + 2 * PW + SW - 1),    
                    dtype=col.dtype)
     #适合小图像处理
     # for oh in range(OH):
@@ -686,13 +840,15 @@ class Conv2d(Function):
         x_np = x.data if isinstance(x, Tensor) else x
         W_np = W.data if isinstance(W, Tensor) else W
         gy_np = gys.data if isinstance(gys, Tensor) else gys
+        
+        xp = get_array_module(x_np)
 
-        if not isinstance(x_np, np.ndarray):
-            x_np = np.array(x_np)
-        if not isinstance(W_np, np.ndarray):
-            W_np = np.array(W_np)
-        if not isinstance(gy_np, np.ndarray):
-            gy_np = np.array(gy_np)
+        if not isinstance(x_np, xp.ndarray):
+            x_np = xp.array(x_np)
+        if not isinstance(W_np, xp.ndarray):
+            W_np = xp.array(W_np)
+        if not isinstance(gy_np, xp.ndarray):
+            gy_np = xp.array(gy_np)
 
         N, C, H_in, W_in = x_np.shape
         _, OC, out_h, out_w = gy_np.shape
@@ -726,12 +882,12 @@ class Conv2d(Function):
         workspace = cls._winograd_backward_workspace_cache.get(workspace_key)
         if workspace is None:
             workspace = {
-                'x_work': np.empty((N, C, xh, xw), dtype=calc_dtype),
-                'L': np.empty((N, C, tile_h, tile_w, 4, 4), dtype=calc_dtype),
-                'V': np.empty((N, C, tile_h, tile_w, 4, 4), dtype=calc_dtype),
-                'gy_buffer': np.empty((N, OC, tile_h * 2, tile_w * 2), dtype=calc_dtype),
-                'dM': np.empty((N, OC, tile_h, tile_w, 4, 4), dtype=calc_dtype),
-                'gU': np.empty((OC, C, 4, 4), dtype=calc_dtype),
+                'x_work': xp.empty((N, C, xh, xw), dtype=calc_dtype),
+                'L': xp.empty((N, C, tile_h, tile_w, 4, 4), dtype=calc_dtype),
+                'V': xp.empty((N, C, tile_h, tile_w, 4, 4), dtype=calc_dtype),
+                'gy_buffer': xp.empty((N, OC, tile_h * 2, tile_w * 2), dtype=calc_dtype),
+                'dM': xp.empty((N, OC, tile_h, tile_w, 4, 4), dtype=calc_dtype),
+                'gU': xp.empty((OC, C, 4, 4), dtype=calc_dtype),
             }
             cls._winograd_backward_workspace_cache[workspace_key] = workspace
             if len(cls._winograd_backward_workspace_cache) > 2:
@@ -766,7 +922,7 @@ class Conv2d(Function):
             if w1 < xw:
                 x_work[:, :, :, w1:] = 0
 
-            tiles = np.lib.stride_tricks.sliding_window_view(x_work, (4, 4), axis=(2, 3))
+            tiles = xp.lib.stride_tricks.sliding_window_view(x_work, (4, 4), axis=(2, 3))
             d = tiles[:, :, 0:2 * tile_h:2, 0:2 * tile_w:2, :, :]
 
             d0 = d[..., 0, :]
@@ -787,7 +943,7 @@ class Conv2d(Function):
             V[..., :, 3] = L[..., :, 1] - L[..., :, 3]
 
         # 2) 反传常量。
-        half = np.array(0.5, dtype=calc_dtype)
+        half = xp.array(0.5, dtype=calc_dtype)
 
         # 3) dY -> dM（与前向 Y = A^T M A 显式公式对应）。
         gy_h = tile_h * 2
@@ -824,14 +980,14 @@ class Conv2d(Function):
 
         # 4) dU：M = U @ V 的反传（仅计算 gU 用于 gW）。
         gU = workspace['gU']
-        np.einsum('nohwab,nchwab->ocab', dM, V, optimize=False, out=gU)
+        xp.einsum('nohwab,nchwab->ocab', dM, V, optimize=False, out=gU)
 
         # 5) gW：U = G g G^T 的显式反传。
         S0 = gU[..., 0, :] + half * (gU[..., 1, :] + gU[..., 2, :])
         S1 = half * (gU[..., 1, :] - gU[..., 2, :])
         S2 = half * (gU[..., 1, :] + gU[..., 2, :]) + gU[..., 3, :]
 
-        gW_np = np.empty((OC, C, 3, 3), dtype=calc_dtype)
+        gW_np = xp.empty((OC, C, 3, 3), dtype=calc_dtype)
         gW_np[..., 0, 0] = S0[..., 0] + half * (S0[..., 1] + S0[..., 2])
         gW_np[..., 0, 1] = half * (S0[..., 1] - S0[..., 2])
         gW_np[..., 0, 2] = half * (S0[..., 1] + S0[..., 2]) + S0[..., 3]
@@ -844,8 +1000,8 @@ class Conv2d(Function):
 
         # 6) gx：与 deconv2d 前向等价的直接数组实现，避免 Function 调度开销。
         kh, kw = W_np.shape[2:]
-        gcol = np.tensordot(W_np, gy_cast, (0, 1))
-        gcol = np.rollaxis(gcol, 3)
+        gcol = xp.tensordot(W_np, gy_cast, (0, 1))
+        gcol = xp.rollaxis(gcol, 3)
         gx_np = col2im_array(
             gcol,
             (N, C, x.shape[2], x.shape[3]),
@@ -868,55 +1024,107 @@ class Conv2d(Function):
         return gx, gW, gb
 
     def im2col_conv2d_forward(self, x, W, b):
+        """
+        使用im2col方法实现卷积的前向传播。
+
+        Args:
+            x: 输入数据，形状 (N, C, H, W)
+            W: 卷积核权重，形状 (OC, C, KH, KW)
+            b: 偏置，形状 (OC,)，可为None
+
+        Returns:
+            卷积结果，形状 (N, OC, OH, OW)
+
+        GPU适配说明:
+            - 优先从权重W获取数组模块类型，因为输出格式由权重决定
+            - 当模型在GPU上但输入数据还在CPU上时，W会是cupy数组
+            - 需要将xp设置为cupy，以便正确执行tensordot操作
+        """
         KH, KW = W.shape[2:]
-        col = im2col_array(x, (KH, KW), self.stride, self.pad, to_matrix=False, dilation=self.dilation)
-        y = np.tensordot(col, W, ((1, 2, 3), (1, 2, 3)))
+
+        # 关键修复：优先从权重W获取数组模块，而非输入x
+        # 这样可以确保当x是numpy但W是cupy时，使用cupy进行计算
+        W_data = W.data if isinstance(W, Tensor) else W
+        xp = get_array_module(W_data)
+
+        # 使用指定的xp模块执行im2col，确保所有操作在同一个设备上
+        col = im2col_array(x, (KH, KW), self.stride, self.pad, to_matrix=False, dilation=self.dilation, xp=xp)
+        y = xp.tensordot(col, W_data, ((1, 2, 3), (1, 2, 3)))
         if b is not None:
-            y += b
-        y = np.rollaxis(y, 3, 1)
+            y += b.data if isinstance(b, Tensor) else b
+        y = xp.rollaxis(y, 3, 1)
         # y = np.transpose(y, (0, 3, 1, 2))
         return y
 
     def gemm_conv2d_forward(self, x, W, b):
+        """
+        使用GEMM方法实现卷积的前向传播（基于滑动窗口视图）。
+
+        Args:
+            x: 输入数据，形状 (N, C, H, W)
+            W: 卷积核权重，形状 (OC, C, KH, KW)
+            b: 偏置，形状 (OC,)，可为None
+
+        Returns:
+            卷积结果，形状 (N, OC, OH, OW)
+
+        GPU适配说明:
+            - 优先从权重W获取数组模块类型，因为输出格式由权重决定
+            - 当模型在GPU上但输入数据还在CPU上时，W会是cupy数组
+            - 需要将xp设置为cupy，以便正确执行einsum操作
+        """
         N, OC, KH, KW, OH, OW = self._gemm_output_shape(x, W)
+
+        # 关键修复：优先从权重W获取数组模块，而非输入x
+        # 这样可以确保当x是numpy但W是cupy时，使用cupy进行计算
+        W_data = W.data if isinstance(W, Tensor) else W
+        xp = get_array_module(W_data)
+
         if OH <= 0 or OW <= 0:
             oh = OH if OH > 0 else 0
             ow = OW if OW > 0 else 0
-            return np.zeros((N, OC, oh, ow), dtype=x.dtype)
+            return xp.zeros((N, OC, oh, ow), dtype=x.dtype)
 
         SH, SW = self.stride
         PH, PW = self.pad
         DH, DW = self.dilation
 
-        x_pad = np.pad(x, ((0, 0), (0, 0), (PH, PH), (PW, PW)), mode='constant')
+        # 如果x不是xp类型的数组，需要先转换
+        # 使用to_xp辅助函数正确处理numpy/cupy之间的转换
+        x_data = to_xp(x, xp)
+
+        x_pad = xp.pad(x_data, ((0, 0), (0, 0), (PH, PH), (PW, PW)), mode='constant')
         eff_kh = DH * (KH - 1) + 1
         eff_kw = DW * (KW - 1) + 1
 
-        windows = np.lib.stride_tricks.sliding_window_view(x_pad, (eff_kh, eff_kw), axis=(2, 3))
+        windows = xp.lib.stride_tricks.sliding_window_view(x_pad, (eff_kh, eff_kw), axis=(2, 3))
         windows = windows[:, :, :OH * SH:SH, :OW * SW:SW, :, :]
         patches = windows[..., ::DH, ::DW]
 
-        y = np.einsum('nchwkl,ockl->nohw', patches, W, optimize=True)
+        y = xp.einsum('nchwkl,ockl->nohw', patches, W_data, optimize=True)
         if b is not None:
-            y += b.reshape(1, -1, 1, 1)
+            b_data = to_xp(b, xp)
+            y += b_data.reshape(1, -1, 1, 1)
         return y
 
     def winograd_conv2d_forward(self, x, W, b):
         # --- 1. 数据提取与类型转换 ---
         x_np = x.data if isinstance(x, Tensor) else x
         W_np = W.data if isinstance(W, Tensor) else W
+        
+        xp = get_array_module(x_np)
 
-        if not isinstance(x_np, np.ndarray):
-            x_np = np.array(x_np)
-        if not isinstance(W_np, np.ndarray):
-            W_np = np.array(W_np)
+        if not isinstance(x_np, xp.ndarray):
+            x_np = xp.array(x_np)
+        if not isinstance(W_np, xp.ndarray):
+            W_np = xp.array(W_np)
 
         N, C, H_in, W_in = x_np.shape
         OC, _, KH, KW = W_np.shape
 
         ph, pw = self.pad
         dtype = x_np.dtype
-        calc_dtype = np.result_type(x_np.dtype, W_np.dtype)
+        calc_dtype = xp.result_type(x_np.dtype, W_np.dtype)
 
         # --- 2. Padding 与 tile 布局 ---
         out_h = (H_in + 2 * ph - KH) + 1
@@ -925,7 +1133,7 @@ class Conv2d(Function):
         if out_h <= 0 or out_w <= 0:
             oh = out_h if out_h > 0 else 0
             ow = out_w if out_w > 0 else 0
-            return np.zeros((N, OC, oh, ow), dtype=dtype)
+            return xp.zeros((N, OC, oh, ow), dtype=dtype)
 
         tile_h = (out_h + 1) // 2
         tile_w = (out_w + 1) // 2
@@ -953,18 +1161,18 @@ class Conv2d(Function):
             cls._winograd_u_cache = {}
         if not hasattr(cls, '_winograd_workspace_cache'):
             cls._winograd_workspace_cache = {}
-
-        dtype_key = np.dtype(calc_dtype).str
+        
+        dtype_key = xp.dtype(calc_dtype).str
         workspace_key = (N, C, OC, tile_h, tile_w, xh, xw, dtype_key)
         workspace = cls._winograd_workspace_cache.get(workspace_key)
         if workspace is None:
             tile_count = N * tile_h * tile_w
             workspace = {
-                'x_work': np.empty((N, C, xh, xw), dtype=calc_dtype),
-                'L': np.empty((N, C, tile_h, tile_w, 4, 4), dtype=calc_dtype),
-                'V': np.empty((N, C, tile_h, tile_w, 4, 4), dtype=calc_dtype),
-                'M16': np.empty((16, OC, tile_count), dtype=calc_dtype),
-                'y_buffer': np.empty((N, OC, tile_h * 2, tile_w * 2), dtype=calc_dtype),
+                'x_work': xp.empty((N, C, xh, xw), dtype=calc_dtype),
+                'L': xp.empty((N, C, tile_h, tile_w, 4, 4), dtype=calc_dtype),
+                'V': xp.empty((N, C, tile_h, tile_w, 4, 4), dtype=calc_dtype),
+                'M16': xp.empty((16, OC, tile_count), dtype=calc_dtype),
+                'y_buffer': xp.empty((N, OC, tile_h * 2, tile_w * 2), dtype=calc_dtype),
                 'version': 0,
             }
             cls._winograd_workspace_cache[workspace_key] = workspace
@@ -985,8 +1193,8 @@ class Conv2d(Function):
             x_work[:, :, :, w1:] = 0
         consts = cls._winograd_consts_by_dtype.get(dtype_key)
         if consts is None:
-            half = np.array(0.5, dtype=calc_dtype)
-            one = np.array(1.0, dtype=calc_dtype)
+            half = xp.array(0.5, dtype=calc_dtype)
+            one = xp.array(1.0, dtype=calc_dtype)
             consts = (half, one)
             cls._winograd_consts_by_dtype[dtype_key] = consts
         half, _ = consts
@@ -1001,19 +1209,19 @@ class Conv2d(Function):
             g1 = W_work[:, :, 1, :]
             g2 = W_work[:, :, 2, :]
 
-            T = np.empty((OC, C, 4, 3), dtype=calc_dtype)
+            T = xp.empty((OC, C, 4, 3), dtype=calc_dtype)
             T[:, :, 0, :] = g0
             T[:, :, 1, :] = half * (g0 + g1 + g2)
             T[:, :, 2, :] = half * (g0 - g1 + g2)
             T[:, :, 3, :] = g2
 
-            U = np.empty((OC, C, 4, 4), dtype=calc_dtype)
+            U = xp.empty((OC, C, 4, 4), dtype=calc_dtype)
             U[:, :, :, 0] = T[:, :, :, 0]
             U[:, :, :, 1] = half * (T[:, :, :, 0] + T[:, :, :, 1] + T[:, :, :, 2])
             U[:, :, :, 2] = half * (T[:, :, :, 0] - T[:, :, :, 1] + T[:, :, :, 2])
             U[:, :, :, 3] = T[:, :, :, 2]
 
-            U16 = np.ascontiguousarray(U.reshape(OC, C, 16).transpose(2, 0, 1))
+            U16 = xp.ascontiguousarray(U.reshape(OC, C, 16).transpose(2, 0, 1))
             cls._winograd_u_cache[u_cache_key] = (U, U16)
             if len(cls._winograd_u_cache) > 8:
                 cls._winograd_u_cache.pop(next(iter(cls._winograd_u_cache)))
@@ -1021,7 +1229,7 @@ class Conv2d(Function):
             U, U16 = cached_u
 
         # --- 5. 输入 tile 变换 V = B^T d B（显式向量化公式） ---
-        tiles = np.lib.stride_tricks.sliding_window_view(x_work, (4, 4), axis=(2, 3))
+        tiles = xp.lib.stride_tricks.sliding_window_view(x_work, (4, 4), axis=(2, 3))
         d = tiles[:, :, 0:2 * tile_h:2, 0:2 * tile_w:2, :, :]
 
         d0 = d[..., 0, :]
@@ -1047,7 +1255,7 @@ class Conv2d(Function):
 
         # --- 6. 核心乘法 M（全量 matmul，避免分块循环开销） ---
         V16T = V.reshape(N, C, tile_h, tile_w, 16).transpose(4, 1, 0, 2, 3)
-        V16T = np.ascontiguousarray(V16T.reshape(16, C, N * tile_h * tile_w))
+        V16T = xp.ascontiguousarray(V16T.reshape(16, C, N * tile_h * tile_w))
 
         M16 = workspace['M16']
         np.matmul(U16, V16T, out=M16)
@@ -1073,14 +1281,176 @@ class Conv2d(Function):
         if b is not None:
             b_val = b.data if isinstance(b, Tensor) else b
             if b_val is not None:
-                if not isinstance(b_val, np.ndarray):
-                    b_val = np.array(b_val)
+                if not isinstance(b_val, xp.ndarray):
+                    b_val = xp.array(b_val)
                 y_res += b_val.reshape(1, -1, 1, 1)
 
         return y_res.astype(dtype, copy=False)
 
 def conv2d(x, W, b=None, stride=(1,1), pad=(0,0), dilation=1, visualize=False):
     return Conv2d(stride, pad, dilation, visualize)(x, W, b)
+
+
+def conv2d_backward_input_array(gy, W, stride=(1, 1), pad=(0, 0), dilation=(1, 1), out_h=None, out_w=None):
+    """计算卷积对输入 x 的梯度（支持 dilation）。
+
+    Args:
+        gy: 上游梯度，形状 (N, OC, OH, OW)
+        W: 卷积核，形状 (OC, C, KH, KW)
+    """
+    SH, SW = pair(stride)
+    PH, PW = pair(pad)
+    DH, DW = pair(dilation)
+
+    N, OC, OH, OW = gy.shape
+    OC_W, C, KH, KW = W.shape
+    assert OC == OC_W
+
+    if out_h is None or out_w is None:
+        out_h = SH * (OH - 1) - 2 * PH + DH * (KH - 1) + 1
+        out_w = SW * (OW - 1) - 2 * PW + DW * (KW - 1) + 1
+        
+    xp = get_array_module(gy)
+
+    gx_pad = xp.zeros((N, C, out_h + 2 * PH + SH - 1, out_w + 2 * PW + SW - 1), dtype=gy.dtype)
+
+    for kh in range(KH):
+        h_start = kh * DH
+        h_end = h_start + SH * OH
+        for kw in range(KW):
+            w_start = kw * DW
+            w_end = w_start + SW * OW
+
+            # (N, OC, OH, OW) x (OC, C) -> (N, OH, OW, C) -> (N, C, OH, OW)
+            contrib = xp.tensordot(gy, W[:, :, kh, kw], axes=(1, 0)).transpose(0, 3, 1, 2)
+            gx_pad[:, :, h_start:h_end:SH, w_start:w_end:SW] += contrib
+
+    return gx_pad[:, :, PH:PH + out_h, PW:PW + out_w]
+
+
+class GroupedConv2d(Function):
+    def __init__(self, stride=(1,1), pad=(0,0), groups=1, dilation=1, visualize=False):
+        super().__init__()
+        self.stride = pair(stride)
+        self.pad = pair(pad)
+        self.groups = groups
+        self.dilation = pair(dilation)
+        self.visualize = visualize
+
+    def forward(self, *xs):
+        """
+        分组卷积的前向传播。
+
+        Args:
+            x: 输入数据，形状 (N, C, H, W)
+            W: 权重，形状 (OC, C_per_group, KH, KW)
+            b: 偏置，可为None
+
+        Returns:
+            输出数据
+
+        GPU适配说明:
+            - 优先从权重W获取数组模块类型
+            - 当W是cupy数组时，需要先将x转换为cupy数组
+        """
+        x = xs[0]
+        W = xs[1]
+        b = xs[2]
+
+        N, C, H, W_in = x.shape
+        OC, C_per_group, KH, KW = W.shape
+
+        assert C % self.groups == 0, "Input channels must be divisible by groups"
+        assert OC % self.groups == 0, "Output channels must be divisible by groups"
+
+        # 关键修复：优先从权重W获取数组模块，而非输入x
+        W_data = W.data if isinstance(W, Tensor) else W
+        xp = get_array_module(W_data)
+
+        # 如果x不是xp类型的数组，需要先转换
+        # 使用to_xp辅助函数正确处理numpy/cupy之间的转换
+        x_data = to_xp(x, xp)
+
+        OC_per_group = OC // self.groups
+        OH = get_conv_outsize(H, KH, self.stride[0], self.pad[0], self.dilation[0])
+        OW = get_conv_outsize(W_in, KW, self.stride[1], self.pad[1], self.dilation[1])
+        y = xp.zeros((N, OC, OH, OW), dtype=x_data.dtype)
+
+        for i in range(self.groups):
+            x_group = x_data[:, i*C_per_group:(i+1)*C_per_group, :, :]
+            W_group = W_data[i*OC_per_group:(i+1)*OC_per_group, :, :, :]
+
+            col = im2col_array(
+                x_group, (KH, KW), self.stride, self.pad,
+                to_matrix=False, dilation=self.dilation, xp=xp
+            )
+            y_group = xp.tensordot(col, W_group, ((1, 2, 3), (1, 2, 3)))
+            y_group = xp.rollaxis(y_group, 3, 1)
+            y[:, i*OC_per_group:(i+1)*OC_per_group, :, :] = y_group
+
+        if b is not None:
+            b_data = to_xp(b, xp)
+            y += b_data.reshape(1, -1, 1, 1)
+
+        return y
+
+    def backward(self, gys):
+        x, W, b = self.inputs
+        x_data = x.data
+        W_data = W.data
+        gy = gys.data
+
+        N, C, H, W_in = x_data.shape
+        OC, C_per_group, KH, KW = W_data.shape
+        OC_per_group = OC // self.groups
+        
+        xp = get_array_module(gy)
+
+        gx = xp.zeros_like(x_data)
+        gW = xp.zeros_like(W_data)
+
+        for i in range(self.groups):
+            c0, c1 = i * C_per_group, (i + 1) * C_per_group
+            oc0, oc1 = i * OC_per_group, (i + 1) * OC_per_group
+
+            x_group = x_data[:, c0:c1, :, :]
+            gy_group = gy[:, oc0:oc1, :, :]
+            W_group = W_data[oc0:oc1, :, :, :]
+
+            gx_group = conv2d_backward_input_array(
+                gy_group,
+                W_group,
+                stride=self.stride,
+                pad=self.pad,
+                dilation=self.dilation,
+                out_h=H,
+                out_w=W_in,
+            )
+            gx[:, c0:c1, :, :] += gx_group
+
+            col = im2col_array(
+                x_group, (KH, KW), self.stride, self.pad,
+                to_matrix=False, dilation=self.dilation
+            )
+            gW_group = xp.tensordot(gy_group, col, ((0, 2, 3), (0, 4, 5)))
+            gW[oc0:oc1, :, :, :] = gW_group
+
+        gb = None
+        if b.data is not None:
+            gb = gy.sum(axis=(0, 2, 3))
+
+        return as_Tensor(gx), as_Tensor(gW), (as_Tensor(gb) if gb is not None else None)
+
+
+def grouped_conv2d(x, W, b=None, stride=(1,1), pad=(0,0), groups=1, dilation=1, visualize=False):
+    return GroupedConv2d(stride, pad, groups, dilation, visualize)(x, W, b)
+
+
+# 深度卷积（本质上是 groups == in_channels 的分组卷积）
+def depthwise_conv2d(x, W, b=None, stride=(1,1), pad=(0,0), dilation=1, visualize=False):
+    x = as_Tensor(x)
+    groups = x.shape[1]
+    return grouped_conv2d(x, W, b, stride=stride, pad=pad, groups=groups, dilation=dilation, visualize=visualize)
 
 
 def conv2d_backward_input_array(gy, W, stride=(1, 1), pad=(0, 0), dilation=(1, 1), out_h=None, out_w=None):
@@ -1228,6 +1598,21 @@ class Deconv2d(Function):
 
 
     def forward(self, *xs):
+        """
+        转置卷积的前向传播。
+
+        Args:
+            x: 输入数据，形状 (N, C, H, W)
+            W: 权重，形状 (C, OC, KH, KW)
+            b: 偏置，可为None
+
+        Returns:
+            输出数据
+
+        GPU适配说明:
+            - 优先从权重W获取数组模块类型
+            - 当W是cupy数组时，需要先将x转换为cupy数组
+        """
         x = xs[0]
         W = xs[1]
         b = xs[2]
@@ -1236,22 +1621,30 @@ class Deconv2d(Function):
         PH, PW = self.pad
         DH, DW = self.dilation
         C, OC, KH, KW = Weight.shape
-        N, C, H, W = x.shape
+        N, C, H, W_in = x.shape
         if self.outsize is None:
-            out_h = get_deconv_outsize(H, KH, SH, PH, DH)
-            out_w = get_deconv_outsize(W, KW, SW, PW, DW)
+            out_h = get_deconv_outsize(H, KH, SH, PH)
+            out_w = get_deconv_outsize(W_in, KW, SW, PW)
         else:
             out_h, out_w = pair(self.outsize)
         img_shape = (N, OC, out_h, out_w)
 
-        gcol = np.tensordot(Weight, x, (0, 1))
-        gcol = np.rollaxis(gcol, 3)
+        # 关键修复：优先从权重W获取数组模块，而非输入x
+        W_data = W.data if isinstance(W, Tensor) else W
+        xp = get_array_module(W_data)
+
+        # 如果x不是xp类型的数组，需要先转换
+        # 使用to_xp辅助函数正确处理numpy/cupy之间的转换
+        x_data = to_xp(x, xp)
+
+        gcol = xp.tensordot(W_data, x_data, (0, 1))
+        gcol = xp.rollaxis(gcol, 3)
         y = col2im_array(gcol, img_shape, (KH, KW), self.stride, self.pad,
-                         to_matrix=False, dilation=self.dilation)
-        # b, k, h, w
+                         to_matrix=False)
         if b is not None:
             self.no_bias = True
-            y += b.reshape((1, b.size, 1, 1))
+            b_data = to_xp(b, xp)
+            y += b_data.reshape((1, b_data.size, 1, 1))
         return y
 
     def backward(self, gys):
@@ -1284,12 +1677,29 @@ class Conv2DGradW(Function):
         self.dilation = getattr(conv2d, 'dilation', (1, 1))
 
     def forward(self, *xs):
+        """
+        计算卷积核梯度的前向传播。
+
+        Args:
+            x: 输入数据，形状 (N, C, H, W)
+            gy: 梯度输出，形状 (N, OC, OH, OW)
+
+        Returns:
+            权重梯度
+
+        GPU适配说明:
+            - 优先从gy获取数组模块类型
+            - 当gy是cupy数组时，需要先将x和col转换为cupy数组
+        """
         x = xs[0]
         gy = xs[1]
 
+        gy_data = gy.data if isinstance(gy, Tensor) else gy
+        xp = get_array_module(gy_data)
+
         col = im2col_array(x, self.kernel_size, self.stride, self.pad,
-                           to_matrix=False, dilation=self.dilation)
-        gW = np.tensordot(gy, col, ((0, 2, 3), (0, 4, 5)))
+                           to_matrix=False, dilation=self.dilation, xp=xp)
+        gW = xp.tensordot(gy_data, col, ((0, 2, 3), (0, 4, 5)))
         return gW
     #貌似用不上 也就是gw关于gy和x的倒数
         def backward(self, gys):
@@ -1346,17 +1756,20 @@ class Pooling2DGrad(Function):
         N, C, OH, OW = gy.shape
         N, C, H, W = self.input_shape
         KH, KW = pair(self.kernel_size)
+        
+        xp = get_array_module(gy)
+        
         #与池化操作的维度相同 
-        gcol = np.zeros((N * C * OH * OW * KH * KW), dtype=self.dtype)
+        gcol = xp.zeros((N * C * OH * OW * KH * KW), dtype=self.dtype)
 
         indexes = (self.indexes.ravel()
-                   + np.arange(0, self.indexes.size * KH * KW, KH * KW))
+                   + xp.arange(0, self.indexes.size * KH * KW, KH * KW))
 
         gcol[indexes] = gy.ravel()
         gcol = gcol.reshape(N, C, OH, OW, KH, KW)
         #也可以用transpose
-        gcol = np.swapaxes(gcol, 2, 4)
-        gcol = np.swapaxes(gcol, 3, 5)
+        gcol = xp.swapaxes(gcol, 2, 4)
+        gcol = xp.swapaxes(gcol, 3, 5)
 
         gx = col2im_array(gcol, (N, C, H, W), self.kernel_size, self.stride,
                           self.pad, to_matrix=False)
@@ -1529,23 +1942,25 @@ def batch_norm(x, gamma, beta, moving_mean=None, moving_var=None, eps=1e-5, mome
     # 兼容 moving_mean / moving_var 既可能是 ndarray 也可能是 Parameter
     from .parameter import Parameter
 
+    xp = get_array_module(x)
+
     if moving_mean is None:
-        running_mean = Parameter(np.zeros(c, dtype=x.data.dtype), name='running_mean')
+        running_mean = Parameter(xp.zeros(c, dtype=x.data.dtype), name='running_mean')
         running_mean.requires_grad = False
     elif hasattr(moving_mean, 'data'):
         running_mean = moving_mean
     else:
-        mm = np.asarray(moving_mean)
+        mm = xp.asarray(moving_mean)
         running_mean = Parameter(mm.reshape(c).astype(x.data.dtype), name='running_mean')
         running_mean.requires_grad = False
 
     if moving_var is None:
-        running_var = Parameter(np.ones(c, dtype=x.data.dtype), name='running_var')
+        running_var = Parameter(xp.ones(c, dtype=x.data.dtype), name='running_var')
         running_var.requires_grad = False
     elif hasattr(moving_var, 'data'):
         running_var = moving_var
     else:
-        mv = np.asarray(moving_var)
+        mv = xp.asarray(moving_var)
         running_var = Parameter(mv.reshape(c).astype(x.data.dtype), name='running_var')
         running_var.requires_grad = False
 
@@ -1553,12 +1968,12 @@ def batch_norm(x, gamma, beta, moving_mean=None, moving_var=None, eps=1e-5, mome
 
     # 若传入的是 ndarray，回写统计量，保持旧行为
     if moving_mean is not None and not hasattr(moving_mean, 'data'):
-        if np.asarray(moving_mean).ndim == 1:
+        if xp.asarray(moving_mean).ndim == 1:
             moving_mean[...] = running_mean.data
         else:
             moving_mean[...] = running_mean.data.reshape(moving_mean.shape)
     if moving_var is not None and not hasattr(moving_var, 'data'):
-        if np.asarray(moving_var).ndim == 1:
+        if xp.asarray(moving_var).ndim == 1:
             moving_var[...] = running_var.data
         else:
             moving_var[...] = running_var.data.reshape(moving_var.shape)
@@ -1593,11 +2008,34 @@ class BatchNorm2d(Function):
 
         # 更新 running 统计量（训练时）
         if Config.train:
-            # 转为 (C,) 方便存储
-            m = mean.reshape(C)
-            v = var.reshape(C)
-            self.running_mean.data = self.momentum * self.running_mean.data + (1 - self.momentum) * m
-            self.running_var.data  = self.momentum * self.running_var.data  + (1 - self.momentum) * v
+            # 优先从running_mean获取数组模块（因为它在GPU上）
+            # 如果running_mean是numpy，则使用numpy
+            running_mean_data = self.running_mean.data
+            xp = get_array_module(running_mean_data)
+
+            # 确保所有数组都是xp类型
+            if xp is not np:
+                # 使用to_xp确保所有数组都正确转换
+                m = to_xp(mean.reshape(C), xp)
+                v = to_xp(var.reshape(C), xp)
+                running_mean_data = to_xp(running_mean_data, xp)
+                running_var_data = to_xp(self.running_var.data, xp)
+                momentum = xp.asarray(self.momentum)
+                one_minus_momentum = xp.asarray(1) - momentum
+            else:
+                m = mean.reshape(C)
+                v = var.reshape(C)
+                running_var_data = self.running_var.data
+                momentum = self.momentum
+                one_minus_momentum = 1 - self.momentum
+
+            new_mean = momentum * running_mean_data + one_minus_momentum * m
+            new_var = momentum * running_var_data + one_minus_momentum * v
+
+            # 更新running统计量
+            self.running_mean.data = new_mean
+            self.running_var.data = new_var
+
             # 保存当前 batch 的统计量用于反向传播
             self.mean = mean
             self.var = var
@@ -1609,11 +2047,28 @@ class BatchNorm2d(Function):
             self.var = var
 
         # 归一化
-        x_hat = (x - mean) / np.sqrt(var + self.eps)
+        # 优先从running_mean获取xp，确保一致性
+        xp = get_array_module(self.running_mean.data)
+        if xp is np:
+            xp = get_array_module(x)
+
+        # 确保所有数组都是xp类型
+        if xp is not np:
+            # 将所有数组转换为cupy
+            x = to_xp(x, xp)
+            mean = to_xp(mean, xp)
+            var = to_xp(var, xp)
+            gamma_data = to_xp(gamma, xp)
+            beta_data = to_xp(beta, xp)
+        else:
+            gamma_data = gamma
+            beta_data = beta
+
+        x_hat = (x - mean) / xp.sqrt(var + self.eps)
         # 缩放和偏移
-        out = gamma.reshape(1, C, 1, 1) * x_hat + beta.reshape(1, C, 1, 1)
+        out = gamma_data.reshape(1, C, 1, 1) * x_hat + beta_data.reshape(1, C, 1, 1)
         self.x_hat = x_hat
-        self.gamma = gamma
+        self.gamma = gamma_data
         return out
 
     def backward(self, gys):
@@ -1626,7 +2081,8 @@ class BatchNorm2d(Function):
         M = N * H * W  # 每个通道的像素总数
 
         # 计算中间变量
-        std_inv = 1.0 / np.sqrt(var + eps)
+        xp = get_array_module(x)
+        std_inv = 1.0 / xp.sqrt(var + eps)
         x_hat = self.x_hat
         # 对 gamma 和 beta 的梯度
         gbeta = gys.sum(axis=(0, 2, 3), keepdims=False)  # (C,)
@@ -1663,15 +2119,36 @@ class FusedConvReLU(Function):
         self.visualize = visualize
 
     def forward(self, *xs):
+        """
+        融合 Conv2d + ReLU 的前向传播。
+
+        Args:
+            x: 输入数据
+            W: 权重
+            b: 偏置
+
+        GPU适配说明:
+            - 优先从权重W获取数组模块类型
+            - 当W是cupy数组时，需要先将x转换为cupy数组
+        """
         x, W, b = xs
         KH, KW = W.shape[2:]
 
+        # 关键修复：优先从权重W获取数组模块，而非输入x
+        W_data = W.data if isinstance(W, Tensor) else W
+        xp = get_array_module(W_data)
+
+        # 如果x不是xp类型的数组，需要先转换
+        # 注意：x可能是Tensor对象，需要先提取其data
+        x_data = to_xp(x, xp)
+
         # 1. im2col + 卷积
-        col = im2col_array(x, (KH, KW), self.stride, self.pad, to_matrix=False, dilation=self.dilation)
-        conv_out = np.tensordot(col, W, ((1, 2, 3), (1, 2, 3)))
+        col = im2col_array(x_data, (KH, KW), self.stride, self.pad, to_matrix=False, dilation=self.dilation, xp=xp)
+        conv_out = xp.tensordot(col, W_data, ((1, 2, 3), (1, 2, 3)))
         if b is not None:
-            conv_out += b
-        conv_out = np.rollaxis(conv_out, 3, 1)
+            b_data = to_xp(b, xp)
+            conv_out += b_data
+        conv_out = xp.rollaxis(conv_out, 3, 1)
 
         # 2. 融合 ReLU：计算掩码并原地修改 conv_out
         self.mask = conv_out > 0
@@ -1731,6 +2208,20 @@ class FusedConvBNReLU(Function):
         self.visualize = visualize
 
     def forward(self, *xs):
+        """
+        融合 Conv2d + BatchNorm2d + ReLU 的前向传播。
+
+        Args:
+            x: 输入数据
+            W: 权重
+            b: 偏置
+            gamma: BN 缩放参数
+            beta: BN 偏移参数
+
+        GPU适配说明:
+            - 优先从权重W获取数组模块类型
+            - 当W是cupy数组时，需要先将x转换为cupy数组
+        """
         # 输入：x, W, b, gamma, beta
         x, W, b, gamma, beta = xs
         OC, _, KH, KW = W.shape
@@ -1739,14 +2230,23 @@ class FusedConvBNReLU(Function):
         if not hasattr(self,'outsize'):
             self.outsize = OC
 
+        # 关键修复：优先从权重W获取数组模块，而非输入x
+        W_data = W.data if isinstance(W, Tensor) else W
+        xp = get_array_module(W_data)
+
+        # 如果x不是xp类型的数组，需要先转换
+        # 使用to_xp辅助函数正确处理numpy/cupy之间的转换
+        x_data = to_xp(x, xp)
+
         # ---------- 1. 卷积 ----------
         # im2col
-        col = im2col_array(x.data, (KH, KW), self.stride, self.pad, to_matrix=False, dilation=self.dilation)
+        col = im2col_array(x_data, (KH, KW), self.stride, self.pad, to_matrix=False, dilation=self.dilation, xp=xp)
         # 卷积输出 (N, OH, OW, OC)
-        conv_out = np.tensordot(col, W, ((1, 2, 3), (1, 2, 3)))
+        conv_out = xp.tensordot(col, W_data, ((1, 2, 3), (1, 2, 3)))
         if b is not None:
-            conv_out += b
-        conv_out = np.rollaxis(conv_out, 3, 1)
+            b_data = to_xp(b, xp)
+            conv_out += b_data
+        conv_out = xp.rollaxis(conv_out, 3, 1)
 
         # 保存卷积输出和输入，用于反向
         self.x = x
@@ -1765,9 +2265,9 @@ class FusedConvBNReLU(Function):
             v = var.reshape(OC)
             
             if self.running_mean is None:
-                self.running_mean = Tensor(np.zeros(OC, dtype=x.data.dtype), requires_grad=False, name='running_mean')
+                self.running_mean = Tensor(xp.zeros(OC, dtype=np.float32), requires_grad=False, name='running_mean')
             if self.running_var is None:
-                self.running_var = Tensor(np.ones(OC, dtype=x.data.dtype), requires_grad=False, name='running_mean')
+                self.running_var = Tensor(xp.ones(OC, dtype=np.float32), requires_grad=False, name='running_mean')
 
             self.running_mean.data = self.momentum * self.running_mean.data + (1 - self.momentum) * m
             self.running_var.data  = self.momentum * self.running_var.data  + (1 - self.momentum) * v
@@ -1776,9 +2276,9 @@ class FusedConvBNReLU(Function):
         else:
             # 测试模式：使用 running 统计量
             if self.running_mean is None:
-                self.running_mean = Tensor(np.zeros(OC, dtype=x.data.dtype), requires_grad=False, name='running_mean')
+                self.running_mean = Tensor(xp.zeros(OC, dtype=np.float32), requires_grad=False, name='running_mean')
             if self.running_var is None:
-                self.running_var = Tensor(np.ones(OC, dtype=x.data.dtype), requires_grad=False, name='running_mean')
+                self.running_var = Tensor(xp.ones(OC, dtype=np.float32), requires_grad=False, name='running_mean')
 
             mean = self.running_mean.data.reshape(1, OC, 1, 1)
             var = self.running_var.data.reshape(1, OC, 1, 1)
@@ -1786,7 +2286,7 @@ class FusedConvBNReLU(Function):
             self.var = var
 
         # 归一化、缩放、平移
-        std_inv = 1.0 / np.sqrt(var + self.eps)
+        std_inv = 1.0 / xp.sqrt(var + self.eps)
         x_hat = (conv_out - mean) * std_inv
         gamma_reshaped = gamma.reshape(1, OC, 1, 1)
         beta_reshaped  = beta.reshape(1, OC, 1, 1)
@@ -1818,6 +2318,8 @@ class FusedConvBNReLU(Function):
         N, C, H, W = x.shape
         M = N * H * W   # 每个通道的像素总数
         OC, _, KH, KW = self.W.shape
+        
+        xp = get_array_module(x)
 
         # 计算 gamma 和 beta 的梯度
         gbeta = g_relu.sum(axis=(0,2,3), keepdims=False)          # (OC,)
@@ -1836,7 +2338,7 @@ class FusedConvBNReLU(Function):
         # 使用卷积的反向传播公式
         # gW: (OC, C, KH, KW)
         col_x = im2col_array(self.x.data, (KH, KW), self.stride, self.pad, to_matrix=False, dilation=self.dilation)
-        gW = np.tensordot(g_conv_out, col_x, ((0,2,3), (0,4,5)))   # (OC, C, KH, KW)
+        gW = xp.tensordot(g_conv_out, col_x, ((0,2,3), (0,4,5)))   # (OC, C, KH, KW)
 
         # gb (如果有偏置)
         gb = None

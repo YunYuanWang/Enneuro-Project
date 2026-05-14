@@ -6,5 +6,15 @@ __pycache__/
 Enneuro-Project - 251226/
 *checkpoint*
 *test*.json
-
-code/tests/testdata/data
+code/tests/*.json
+code/tests/testdata/
+code/tests/test_donkey/data/
+code/tests/data.zip
+tests/*.json
+tests/testdata/
+tests/test_donkey/data/
+tests/data.zip
+*.json
+*.png
+*.jpg
+*.jpeg
