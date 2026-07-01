@@ -19,3 +19,6 @@ tests/data.zip
 *.jpg
 *.jpeg
 CLAUDE.md
+*.docx
+*.pdf
+*.doc
